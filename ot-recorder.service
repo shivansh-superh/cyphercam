@@ -15,7 +15,7 @@ ExecStart=/usr/local/bin/ot-recorder
 
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=60
+StartLimitInterval=60
 StartLimitBurst=5
 
 # Give ffmpeg time to flush its current segment on SIGTERM
