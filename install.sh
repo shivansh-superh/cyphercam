@@ -43,7 +43,8 @@ fi
 chown -R "$SERVICE_USER:$SERVICE_GROUP" /var/lib/ot-recorder
 
 echo "==> Installing Python package"
-pip3 install --break-system-packages --upgrade pip setuptools wheel
+# Don't pip-upgrade wheel on Debian/Ubuntu — apt installs it without pip RECORD metadata.
+pip3 install --break-system-packages --upgrade --ignore-installed pip setuptools
 pip3 install --break-system-packages "$SCRIPT_DIR"
 
 echo "==> Installing systemd service (User=$SERVICE_USER, Group=$SERVICE_GROUP)"

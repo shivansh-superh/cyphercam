@@ -7,9 +7,6 @@ import logging
 import os
 import shutil
 
-import boto3
-from botocore.exceptions import BotoCoreError, ClientError
-
 from .config import Config
 
 logger = logging.getLogger(__name__)
@@ -45,26 +42,6 @@ def check_disk_space(cfg: Config):
     logger.info(f"Disk check passed: {free_mb}MB free")
 
 
-def check_s3(cfg: Config):
-    try:
-        s3 = boto3.client("s3", region_name=cfg.aws_region)
-        s3.head_bucket(Bucket=cfg.s3_bucket)
-        logger.info(f"S3 check passed: bucket {cfg.s3_bucket} is accessible")
-    except ClientError as e:
-        code = e.response["Error"]["Code"]
-        if code == "403":
-            raise PreflightError(
-                f"S3 bucket {cfg.s3_bucket} exists but access is denied. "
-                "Check IAM role or AWS credentials on this Pi."
-            )
-        elif code == "404":
-            raise PreflightError(f"S3 bucket {cfg.s3_bucket} does not exist.")
-        else:
-            raise PreflightError(f"S3 check failed: {e}")
-    except BotoCoreError as e:
-        raise PreflightError(f"S3 check failed (network/config issue): {e}")
-
-
 def check_ffmpeg():
     if not shutil.which("ffmpeg"):
         raise PreflightError(
@@ -78,5 +55,4 @@ def run_all(cfg: Config):
     check_ffmpeg()
     check_camera(cfg)
     check_disk_space(cfg)
-    check_s3(cfg)
     logger.info("All preflight checks passed.")

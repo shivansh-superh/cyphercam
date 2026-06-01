@@ -5,7 +5,7 @@ Wires together: config → preflight → manifest → uploader → ffmpeg → tr
 
 Lifecycle:
   1. Load config and validate env vars
-  2. Run preflight checks (camera, disk, S3, ffmpeg)
+  2. Run preflight checks (camera, disk, ffmpeg)
   3. Load manifest, recover any unfinished uploads from last run
   4. Start uploader thread
   5. Start trigger HTTP server
