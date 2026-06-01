@@ -1,0 +1,32 @@
+[Unit]
+Description=OT Video Recorder
+After=network-online.target dev-video0.device
+Wants=network-online.target
+Requires=dev-video0.device
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+
+EnvironmentFile=/etc/ot-agent/env
+
+ExecStart=/usr/local/bin/ot-recorder
+
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Give ffmpeg time to flush its current segment on SIGTERM
+TimeoutStopSec=60
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ot-recorder
+
+# Prevent runaway disk usage
+LimitFSIZE=10G
+
+[Install]
+WantedBy=multi-user.target
