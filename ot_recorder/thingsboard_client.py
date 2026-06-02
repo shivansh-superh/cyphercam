@@ -11,6 +11,7 @@ Publishes recorder status as device telemetry on connect and after each RPC.
 
 import json
 import logging
+import ssl
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -31,6 +32,15 @@ METHOD_STOP = "stopRecording"
 
 RECONNECT_BASE_DELAY = 2
 RECONNECT_MAX_DELAY = 60
+CONNECT_TIMEOUT_SEC = 30
+
+
+def _mqtt_failed(reason_code) -> bool:
+    if reason_code is None:
+        return False
+    if hasattr(reason_code, "is_failure"):
+        return reason_code.is_failure
+    return int(reason_code) != 0
 
 
 class ThingsBoardClient:
@@ -48,6 +58,7 @@ class ThingsBoardClient:
         self._client: Optional[mqtt.Client] = None
         self._stop_event = threading.Event()
         self._connected = threading.Event()
+        self._session_lost = threading.Event()
 
     def start(self):
         self._stop_event.clear()
@@ -92,25 +103,51 @@ class ThingsBoardClient:
                 break
             delay = min(delay * 2, RECONNECT_MAX_DELAY)
 
+    def _configure_tls(self, client: mqtt.Client) -> None:
+        ca_file = self.cfg.tb_mqtt_ca_file
+        if not ca_file:
+            try:
+                import certifi
+
+                ca_file = certifi.where()
+            except ImportError:
+                ca_file = None
+        if ca_file:
+            client.tls_set(ca_certs=ca_file, cert_reqs=ssl.CERT_REQUIRED)
+        else:
+            client.tls_set(cert_reqs=ssl.CERT_REQUIRED)
+
     def _connect_and_loop(self):
         client = mqtt.Client(
             callback_api_version=CallbackAPIVersion.VERSION2,
             client_id=f"ot-recorder-{self.cfg.ot_location_id}",
         )
         if self.cfg.tb_mqtt_use_tls:
-            client.tls_set()
+            self._configure_tls(client)
         client.username_pw_set(self.cfg.tb_access_token)
         client.on_connect = self._on_connect
         client.on_message = self._on_message
         client.on_disconnect = self._on_disconnect
         self._client = client
         self._connected.clear()
+        self._session_lost.clear()
+        self._connect_outcome = threading.Event()
+        self._connect_error: str | None = None
 
         client.connect(self.cfg.tb_host, self.cfg.tb_mqtt_port, keepalive=60)
         client.loop_start()
 
-        while not self._stop_event.is_set() and client.is_connected():
-            time.sleep(0.5)
+        if not self._connect_outcome.wait(timeout=CONNECT_TIMEOUT_SEC):
+            raise TimeoutError(
+                f"ThingsBoard MQTT connect timed out after {CONNECT_TIMEOUT_SEC}s"
+            )
+        if self._connect_error:
+            raise ConnectionError(self._connect_error)
+
+        # paho-mqtt 2.x client.is_connected() is unreliable here; wait for on_disconnect.
+        while not self._stop_event.is_set():
+            if self._session_lost.wait(timeout=1.0):
+                break
 
         client.loop_stop()
         try:
@@ -119,17 +156,24 @@ class ThingsBoardClient:
             pass
 
     def _on_connect(self, client, userdata, flags, reason_code, properties=None):
-        if reason_code != 0:
-            logger.error(f"ThingsBoard MQTT connect failed: {reason_code}")
-            return
-        logger.info("Connected to ThingsBoard")
-        client.subscribe(RPC_SUBSCRIBE, qos=1)
-        self._connected.set()
-        self._publish_telemetry()
+        try:
+            if _mqtt_failed(reason_code):
+                self._connect_error = f"CONNACK failed: {reason_code}"
+                logger.error(f"ThingsBoard MQTT connect failed: {reason_code}")
+                return
+            self._connect_error = None
+            logger.info("Connected to ThingsBoard")
+            client.subscribe(RPC_SUBSCRIBE, qos=1)
+            self._connected.set()
+            self._publish_telemetry()
+        finally:
+            if hasattr(self, "_connect_outcome"):
+                self._connect_outcome.set()
 
     def _on_disconnect(self, client, userdata, flags, reason_code, properties=None):
         self._connected.clear()
-        if reason_code != 0 and not self._stop_event.is_set():
+        self._session_lost.set()
+        if _mqtt_failed(reason_code) and not self._stop_event.is_set():
             logger.warning(f"Disconnected from ThingsBoard (rc={reason_code})")
 
     def _on_message(self, client, userdata, msg):

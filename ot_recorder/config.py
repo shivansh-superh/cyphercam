@@ -28,6 +28,7 @@ class Config:
     tb_access_token: str
     tb_mqtt_port: int
     tb_mqtt_use_tls: bool
+    tb_mqtt_ca_file: str | None
 
     camera_device: str
     video_width: int
@@ -38,6 +39,14 @@ class Config:
     manifest_path: str
 
     min_free_disk_mb: int
+
+
+def _normalize_tb_host(raw: str) -> str:
+    host = raw.strip().rstrip("/")
+    for prefix in ("https://", "http://", "mqtts://", "mqtt://"):
+        if host.lower().startswith(prefix):
+            host = host[len(prefix) :]
+    return host.split("/")[0]
 
 
 def load_config() -> Config:
@@ -63,10 +72,11 @@ def load_config() -> Config:
         s3_prefix=os.environ["S3_PREFIX"],
         aws_region=os.environ["AWS_DEFAULT_REGION"],
 
-        tb_host=os.environ["TB_HOST"],
-        tb_access_token=os.environ["TB_ACCESS_TOKEN"],
+        tb_host=_normalize_tb_host(os.environ["TB_HOST"]),
+        tb_access_token=os.environ["TB_ACCESS_TOKEN"].strip(),
         tb_mqtt_use_tls=tb_mqtt_use_tls,
         tb_mqtt_port=tb_mqtt_port,
+        tb_mqtt_ca_file=os.environ.get("TB_MQTT_CA_FILE") or None,
 
         camera_device=os.environ.get("CAMERA_DEVICE", "/dev/video0"),
         video_width=int(os.environ.get("VIDEO_WIDTH", "1920")),
