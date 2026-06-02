@@ -6,6 +6,7 @@ Each check raises PreflightError with a clear message on failure.
 import logging
 import os
 import shutil
+import threading
 
 from .config import Config
 
@@ -56,3 +57,26 @@ def run_all(cfg: Config):
     check_camera(cfg)
     check_disk_space(cfg)
     logger.info("All preflight checks passed.")
+
+
+def wait_until_ready(
+    cfg: Config,
+    shutdown_event: threading.Event,
+    interval_sec: float = 5.0,
+) -> None:
+    """
+    Block until preflight passes or shutdown_event is set (SIGTERM).
+    Retries camera/disk checks so hot-plug works without systemd device units.
+    """
+    logger.info("Running preflight checks...")
+    check_ffmpeg()
+    while not shutdown_event.is_set():
+        try:
+            check_camera(cfg)
+            check_disk_space(cfg)
+            logger.info("All preflight checks passed.")
+            return
+        except PreflightError as exc:
+            logger.warning("%s — retrying in %ss", exc, interval_sec)
+            shutdown_event.wait(interval_sec)
+    logger.info("Shutdown requested before preflight completed.")

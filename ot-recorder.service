@@ -1,8 +1,10 @@
 [Unit]
 Description=OT Video Recorder
-After=network-online.target dev-video0.device
+After=network-online.target
 Wants=network-online.target
-Requires=dev-video0.device
+# Do not Requires=dev-video0.device — if the camera is missing at boot,
+# systemd times out that device unit and stays dead even after hot-plug.
+# The recorder waits for the camera in-process instead.
 
 [Service]
 Type=simple
@@ -15,8 +17,6 @@ ExecStart=/usr/local/bin/ot-recorder
 
 Restart=always
 RestartSec=5
-StartLimitInterval=60
-StartLimitBurst=5
 
 # Give ffmpeg time to flush its current segment on SIGTERM
 TimeoutStopSec=60

@@ -25,7 +25,7 @@ from typing import Optional
 from .config import load_config
 from .ffmpeg_manager import FFmpegManager
 from .manifest import Manifest
-from .preflight import PreflightError, run_all as run_preflight
+from .preflight import wait_until_ready
 from .thingsboard_client import ThingsBoardClient
 from .uploader import Uploader
 
@@ -224,9 +224,12 @@ class Recorder:
             f"at {self.cfg.ot_hospital_id}"
         )
 
-        run_preflight(self.cfg)
-
         self._setup_signal_handlers()
+        wait_until_ready(self.cfg, self._shutdown_event)
+        if self._shutdown_event.is_set():
+            logger.info("Exiting before recorder was ready.")
+            return
+
         self._recover_from_crash()
 
         self.uploader.start()
