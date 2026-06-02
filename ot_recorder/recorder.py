@@ -1,17 +1,17 @@
 """
 Main recorder process.
 
-Wires together: config → preflight → manifest → uploader → ffmpeg → trigger server.
+Wires together: config → preflight → manifest → uploader → ffmpeg → ThingsBoard client.
 
 Lifecycle:
   1. Load config and validate env vars
   2. Run preflight checks (camera, disk, ffmpeg)
   3. Load manifest, recover any unfinished uploads from last run
   4. Start uploader thread
-  5. Start trigger HTTP server
-  6. Wait for HMS start signal
+  5. Connect to ThingsBoard (MQTT RPC)
+  6. Wait for startRecording RPC
   7. On start: begin recording, ffmpeg chunks → uploader
-  8. On stop: stop ffmpeg cleanly, drain uploader, notify HMS of completion
+  8. On stop: stop ffmpeg cleanly, drain uploader
   9. On SIGTERM: same as stop, then exit
 """
 
@@ -26,7 +26,7 @@ from .config import load_config
 from .ffmpeg_manager import FFmpegManager
 from .manifest import Manifest
 from .preflight import PreflightError, run_all as run_preflight
-from .trigger_server import TriggerServer
+from .thingsboard_client import ThingsBoardClient
 from .uploader import Uploader
 
 logging.basicConfig(
@@ -43,7 +43,7 @@ class Recorder:
         self.manifest = Manifest(self.cfg.manifest_path)
         self.uploader = Uploader(self.cfg, self.manifest)
         self.ffmpeg = FFmpegManager(self.cfg, on_chunk_complete=self._on_chunk_complete)
-        self.trigger_server = TriggerServer(
+        self.thingsboard = ThingsBoardClient(
             cfg=self.cfg,
             on_start=self._on_start,
             on_stop=self._on_stop,
@@ -57,7 +57,7 @@ class Recorder:
         self._shutdown_event = threading.Event()
 
     # -------------------------------------------------------------------------
-    # Start / stop (called by trigger server from its thread)
+    # Start / stop (called by ThingsBoard RPC handler)
     # -------------------------------------------------------------------------
 
     def _on_start(self, surgery_id: str, scheduled_duration_minutes: Optional[int]):
@@ -73,10 +73,11 @@ class Recorder:
         )
         self.ffmpeg.start(surgery_id)
         logger.info(f"Recording started for surgery {surgery_id}")
+        self.thingsboard.publish_status()
 
         if scheduled_duration_minutes:
             # Auto-stop after scheduled duration as a safety net
-            # HMS should also send an explicit stop, but this ensures
+            # ThingsBoard should also send stopRecording, but this ensures
             # we don't record forever if the stop signal is lost
             stop_after = scheduled_duration_minutes * 60 + 300  # +5 min grace
             t = threading.Timer(stop_after, self._auto_stop, args=[surgery_id])
@@ -104,6 +105,7 @@ class Recorder:
             self._state = "idle"
 
         logger.info(f"Recording complete for surgery {surgery_id}")
+        self.thingsboard.publish_status()
 
     def _auto_stop(self, surgery_id: str):
         logger.warning(f"Auto-stop triggered for surgery {surgery_id} (scheduled duration exceeded)")
@@ -149,7 +151,7 @@ class Recorder:
         )
 
     # -------------------------------------------------------------------------
-    # Status (called by trigger server for /health)
+    # Status (published as ThingsBoard telemetry)
     # -------------------------------------------------------------------------
 
     def _get_status(self) -> dict:
@@ -228,15 +230,15 @@ class Recorder:
         self._recover_from_crash()
 
         self.uploader.start()
-        self.trigger_server.start()
+        self.thingsboard.start()
 
-        logger.info("Recorder ready. Waiting for HMS trigger...")
+        logger.info("Recorder ready. Waiting for ThingsBoard RPC...")
 
         # Block main thread until SIGTERM
         self._shutdown_event.wait()
 
         logger.info("Shutting down...")
-        self.trigger_server.stop()
+        self.thingsboard.stop()
         self.uploader.stop(drain_timeout=120)
         logger.info("Recorder exited cleanly")
 

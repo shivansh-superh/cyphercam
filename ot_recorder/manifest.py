@@ -2,14 +2,13 @@
 Local SQLite manifest.
 
 Tracks every chunk from the moment ffmpeg writes it to the moment
-it's confirmed uploaded and HMS has been notified. Survives crashes —
-on restart the recorder checks here for anything left unfinished.
+it's confirmed uploaded to S3. Survives crashes — on restart the recorder
+checks here for anything left unfinished.
 
 Chunk states:
   pending   — file exists locally, upload not started
   uploading — upload in progress (if we crash here, treat as pending on restart)
-  uploaded  — S3 confirmed, HMS not yet notified
-  complete  — S3 confirmed + HMS notified, safe to delete local file
+  complete  — S3 confirmed, local file deleted
   failed    — permanent failure after all retries (needs manual intervention)
 """
 
@@ -68,7 +67,6 @@ class Manifest:
                     status              TEXT NOT NULL DEFAULT 'pending',
                     recorded_at         TEXT,
                     uploaded_at         TEXT,
-                    hms_notified_at     TEXT,
                     retry_count         INTEGER NOT NULL DEFAULT 0,
                     error               TEXT,
                     UNIQUE(surgery_id, chunk_sequence),
@@ -135,19 +133,31 @@ class Manifest:
                 "UPDATE chunks SET status='uploading' WHERE id=?", (chunk_id,)
             )
 
-    def mark_uploaded(self, chunk_id: int, s3_key: str):
+    def mark_complete(self, chunk_id: int, s3_key: str):
         with self._conn() as conn:
             conn.execute(
-                "UPDATE chunks SET status='uploaded', s3_key=?, uploaded_at=? WHERE id=?",
+                "UPDATE chunks SET status='complete', s3_key=?, uploaded_at=? WHERE id=?",
                 (s3_key, _now(), chunk_id),
             )
 
-    def mark_hms_notified(self, chunk_id: int):
+    def migrate_legacy_uploaded(self) -> list[str]:
+        """Upgrade legacy 'uploaded' rows to complete and return local paths to clean up."""
         with self._conn() as conn:
-            conn.execute(
-                "UPDATE chunks SET status='complete', hms_notified_at=? WHERE id=?",
-                (_now(), chunk_id),
-            )
+            rows = conn.execute(
+                "SELECT local_path FROM chunks WHERE status='uploaded'"
+            ).fetchall()
+            paths = [row["local_path"] for row in rows]
+            if paths:
+                conn.execute(
+                    """
+                    UPDATE chunks
+                    SET status='complete', uploaded_at=COALESCE(uploaded_at, ?)
+                    WHERE status='uploaded'
+                    """,
+                    (_now(),),
+                )
+                logger.info(f"Migrated {len(paths)} legacy uploaded chunks to complete")
+            return paths
 
     def mark_failed(self, chunk_id: int, error: str):
         with self._conn() as conn:
@@ -176,14 +186,6 @@ class Manifest:
                 WHERE status IN ('pending', 'uploading')
                 ORDER BY chunk_sequence ASC
                 """
-            ).fetchall()
-            return [dict(r) for r in rows]
-
-    def get_uploaded_not_notified(self) -> list[dict]:
-        """Chunks on S3 but HMS hasn't been told yet."""
-        with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT * FROM chunks WHERE status='uploaded' ORDER BY chunk_sequence ASC"
             ).fetchall()
             return [dict(r) for r in rows]
 

@@ -56,6 +56,6 @@ systemctl enable ot-recorder.service
 
 echo ""
 echo "Done. Next steps:"
-echo "  1. Edit /etc/ot-agent/env with your OT identity, S3 bucket, and HMS details"
+echo "  1. Edit /etc/ot-agent/env with OT identity, S3, and ThingsBoard device token"
 echo "  2. sudo systemctl start ot-recorder"
 echo "  3. sudo journalctl -u ot-recorder -f   # to watch logs"
