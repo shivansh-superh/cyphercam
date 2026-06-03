@@ -62,6 +62,7 @@ class Manifest:
                     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                     surgery_id          TEXT NOT NULL,
                     chunk_sequence      INTEGER NOT NULL,
+                    variant             TEXT NOT NULL DEFAULT 'original',
                     local_path          TEXT NOT NULL,
                     s3_key              TEXT,
                     status              TEXT NOT NULL DEFAULT 'pending',
@@ -69,7 +70,7 @@ class Manifest:
                     uploaded_at         TEXT,
                     retry_count         INTEGER NOT NULL DEFAULT 0,
                     error               TEXT,
-                    UNIQUE(surgery_id, chunk_sequence),
+                    UNIQUE(surgery_id, chunk_sequence, variant),
                     FOREIGN KEY(surgery_id) REFERENCES sessions(surgery_id)
                 );
 
@@ -78,6 +79,44 @@ class Manifest:
                 CREATE INDEX IF NOT EXISTS idx_chunks_surgery
                     ON chunks(surgery_id);
             """)
+            self._migrate_chunks_schema(conn)
+
+    def _migrate_chunks_schema(self, conn: sqlite3.Connection):
+        """Add variant column and unique constraint for DBs created before dual output."""
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(chunks)")}
+        if "variant" in cols:
+            return
+
+        logger.info("Migrating manifest: adding chunk variant column")
+        conn.executescript("""
+            CREATE TABLE chunks_new (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                surgery_id          TEXT NOT NULL,
+                chunk_sequence      INTEGER NOT NULL,
+                variant             TEXT NOT NULL DEFAULT 'original',
+                local_path          TEXT NOT NULL,
+                s3_key              TEXT,
+                status              TEXT NOT NULL DEFAULT 'pending',
+                recorded_at         TEXT,
+                uploaded_at         TEXT,
+                retry_count         INTEGER NOT NULL DEFAULT 0,
+                error               TEXT,
+                UNIQUE(surgery_id, chunk_sequence, variant),
+                FOREIGN KEY(surgery_id) REFERENCES sessions(surgery_id)
+            );
+            INSERT INTO chunks_new (
+                id, surgery_id, chunk_sequence, variant, local_path, s3_key,
+                status, recorded_at, uploaded_at, retry_count, error
+            )
+            SELECT
+                id, surgery_id, chunk_sequence, 'original', local_path, s3_key,
+                status, recorded_at, uploaded_at, retry_count, error
+            FROM chunks;
+            DROP TABLE chunks;
+            ALTER TABLE chunks_new RENAME TO chunks;
+            CREATE INDEX IF NOT EXISTS idx_chunks_status ON chunks(status);
+            CREATE INDEX IF NOT EXISTS idx_chunks_surgery ON chunks(surgery_id);
+        """)
 
     # -------------------------------------------------------------------------
     # Sessions
@@ -116,15 +155,24 @@ class Manifest:
     # Chunks
     # -------------------------------------------------------------------------
 
-    def register_chunk(self, surgery_id: str, chunk_sequence: int, local_path: str, recorded_at: str):
+    def register_chunk(
+        self,
+        surgery_id: str,
+        chunk_sequence: int,
+        variant: str,
+        local_path: str,
+        recorded_at: str,
+    ):
         with self._conn() as conn:
             conn.execute(
                 """
-                INSERT INTO chunks (surgery_id, chunk_sequence, local_path, recorded_at, status)
-                VALUES (?, ?, ?, ?, 'pending')
-                ON CONFLICT(surgery_id, chunk_sequence) DO NOTHING
+                INSERT INTO chunks (
+                    surgery_id, chunk_sequence, variant, local_path, recorded_at, status
+                )
+                VALUES (?, ?, ?, ?, ?, 'pending')
+                ON CONFLICT(surgery_id, chunk_sequence, variant) DO NOTHING
                 """,
-                (surgery_id, chunk_sequence, local_path, recorded_at),
+                (surgery_id, chunk_sequence, variant, local_path, recorded_at),
             )
 
     def mark_uploading(self, chunk_id: int):
@@ -184,7 +232,7 @@ class Manifest:
                 """
                 SELECT * FROM chunks
                 WHERE status IN ('pending', 'uploading')
-                ORDER BY chunk_sequence ASC
+                ORDER BY surgery_id, chunk_sequence, variant
                 """
             ).fetchall()
             return [dict(r) for r in rows]
@@ -192,7 +240,10 @@ class Manifest:
     def get_chunks_for_surgery(self, surgery_id: str) -> list[dict]:
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM chunks WHERE surgery_id=? ORDER BY chunk_sequence ASC",
+                """
+                SELECT * FROM chunks WHERE surgery_id=?
+                ORDER BY chunk_sequence ASC, variant ASC
+                """,
                 (surgery_id,),
             ).fetchall()
             return [dict(r) for r in rows]

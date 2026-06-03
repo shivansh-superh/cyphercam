@@ -51,7 +51,6 @@ class Recorder:
         )
 
         self._current_surgery_id: Optional[str] = None
-        self._chunk_sequence: int = 0
         self._state: str = "idle"  # idle | starting | recording | stopping
         self._state_lock = threading.Lock()
         self._shutdown_event = threading.Event()
@@ -70,7 +69,6 @@ class Recorder:
                 )
                 return
             self._current_surgery_id = surgery_id
-            self._chunk_sequence = 0
             self._state = "starting"
 
         logger.info(f"Recording start accepted for surgery {surgery_id}")
@@ -177,11 +175,15 @@ class Recorder:
     # Chunk callback (called from ffmpeg monitor thread)
     # -------------------------------------------------------------------------
 
-    def _on_chunk_complete(self, local_path: str, recorded_at: str):
+    def _on_chunk_complete(
+        self,
+        local_path: str,
+        recorded_at: str,
+        variant: str,
+        chunk_sequence: int,
+    ):
         with self._state_lock:
             surgery_id = self._current_surgery_id
-            self._chunk_sequence += 1
-            seq = self._chunk_sequence
 
         if not surgery_id:
             logger.warning(f"Chunk completed but no active surgery: {local_path}")
@@ -189,22 +191,33 @@ class Recorder:
 
         self.manifest.register_chunk(
             surgery_id=surgery_id,
-            chunk_sequence=seq,
+            chunk_sequence=chunk_sequence,
+            variant=variant,
             local_path=local_path,
             recorded_at=recorded_at,
         )
 
-        # Look up the chunk id just registered
         chunks = self.manifest.get_chunks_for_surgery(surgery_id)
-        chunk = next((c for c in chunks if c["chunk_sequence"] == seq), None)
+        chunk = next(
+            (
+                c
+                for c in chunks
+                if c["chunk_sequence"] == chunk_sequence and c["variant"] == variant
+            ),
+            None,
+        )
         if not chunk:
-            logger.error(f"Could not find registered chunk seq={seq} in manifest")
+            logger.error(
+                f"Could not find registered chunk seq={chunk_sequence} "
+                f"variant={variant} in manifest"
+            )
             return
 
         self.uploader.enqueue(
             chunk_id=chunk["id"],
             surgery_id=surgery_id,
-            chunk_sequence=seq,
+            chunk_sequence=chunk_sequence,
+            variant=variant,
             local_path=local_path,
             recorded_at=recorded_at,
         )

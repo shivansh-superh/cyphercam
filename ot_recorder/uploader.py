@@ -34,6 +34,7 @@ class UploadJob:
     chunk_id: int
     surgery_id: str
     chunk_sequence: int
+    variant: str
     local_path: str
     recorded_at: str
 
@@ -67,12 +68,20 @@ class Uploader:
             if self._thread.is_alive():
                 logger.warning("Uploader did not drain within timeout")
 
-    def enqueue(self, chunk_id: int, surgery_id: str, chunk_sequence: int,
-                local_path: str, recorded_at: str):
+    def enqueue(
+        self,
+        chunk_id: int,
+        surgery_id: str,
+        chunk_sequence: int,
+        variant: str,
+        local_path: str,
+        recorded_at: str,
+    ):
         job = UploadJob(
             chunk_id=chunk_id,
             surgery_id=surgery_id,
             chunk_sequence=chunk_sequence,
+            variant=variant,
             local_path=local_path,
             recorded_at=recorded_at,
         )
@@ -95,6 +104,7 @@ class Uploader:
                 chunk_id=chunk["id"],
                 surgery_id=chunk["surgery_id"],
                 chunk_sequence=chunk["chunk_sequence"],
+                variant=chunk.get("variant") or "original",
                 local_path=chunk["local_path"],
                 recorded_at=chunk["recorded_at"] or "",
             )
@@ -116,7 +126,7 @@ class Uploader:
                 self._upload_to_s3(job, s3_key)
                 self.manifest.mark_complete(job.chunk_id, s3_key)
                 logger.info(
-                    f"Uploaded chunk {job.chunk_sequence} → "
+                    f"Uploaded chunk {job.chunk_sequence} ({job.variant}) → "
                     f"s3://{self.cfg.s3_bucket}/{s3_key}"
                 )
                 self._delete_local_file(job.local_path)
@@ -157,6 +167,7 @@ class Uploader:
                     "ot-location-id": self.cfg.ot_location_id,
                     "hospital-id": self.cfg.ot_hospital_id,
                     "chunk-sequence": str(job.chunk_sequence),
+                    "variant": job.variant,
                     "recorded-at": job.recorded_at,
                 }
             },
@@ -169,6 +180,7 @@ class Uploader:
             f"{self.cfg.ot_hospital_id}/"
             f"{self.cfg.ot_location_id}/"
             f"{job.surgery_id}/"
+            f"{job.variant}/"
             f"{filename}"
         )
 

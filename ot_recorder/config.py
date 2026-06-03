@@ -34,6 +34,10 @@ class Config:
     video_width: int
     video_height: int
     video_fps: int
+    video_crf: int
+    preview_height: int
+    preview_fps: int
+    preview_crf: int
     chunk_duration_seconds: int
     chunk_dir: str
     manifest_path: str
@@ -82,6 +86,10 @@ def load_config() -> Config:
         video_width=int(os.environ.get("VIDEO_WIDTH", "1920")),
         video_height=int(os.environ.get("VIDEO_HEIGHT", "1080")),
         video_fps=int(os.environ.get("VIDEO_FPS", "30")),
+        video_crf=int(os.environ.get("VIDEO_CRF", "23")),
+        preview_height=int(os.environ.get("PREVIEW_HEIGHT", "720")),
+        preview_fps=int(os.environ.get("PREVIEW_FPS", "1")),
+        preview_crf=int(os.environ.get("PREVIEW_CRF", "28")),
         chunk_duration_seconds=int(os.environ.get("CHUNK_DURATION_SECONDS", "300")),
         chunk_dir=os.environ.get("CHUNK_DIR", "/tmp/ot-chunks"),
         manifest_path=os.environ.get("MANIFEST_PATH", "/var/lib/ot-recorder/manifest.db"),

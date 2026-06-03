@@ -1,17 +1,19 @@
 """
 Manages the ffmpeg subprocess.
 
-ffmpeg writes chunks named by timestamp into:
-  {chunk_dir}/{surgery_id}/YYYYMMDD_HHMMSS.mp4
+ffmpeg writes two segmented streams per surgery:
+  {chunk_dir}/{surgery_id}/original/YYYYMMDD_HHMMSS.mp4  — full resolution
+  {chunk_dir}/{surgery_id}/preview/YYYYMMDD_HHMMSS.mp4   — 720p @ 1 fps
 
-It also writes a segment list file that we use to detect completed chunks
-rather than guessing from file modification time.
+Each stream has its own segment list CSV; chunk_sequence is the 1-based line
+index in that CSV so original and preview rows with the same filename stem align.
 """
 
 import logging
 import os
 import subprocess
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -20,21 +22,34 @@ from .config import Config
 
 logger = logging.getLogger(__name__)
 
+VARIANT_ORIGINAL = "original"
+VARIANT_PREVIEW = "preview"
+
+
+@dataclass(frozen=True)
+class _StreamOutput:
+    variant: str
+    output_dir: Path
+    segment_list_path: Path
+
 
 class FFmpegManager:
-    def __init__(self, cfg: Config, on_chunk_complete: Callable[[str, str], None]):
+    def __init__(
+        self,
+        cfg: Config,
+        on_chunk_complete: Callable[[str, str, str, int], None],
+    ):
         """
-        on_chunk_complete(local_path, recorded_at) is called each time
-        ffmpeg finishes writing a segment and it's safe to upload.
+        on_chunk_complete(local_path, recorded_at, variant, chunk_sequence)
+        is called when ffmpeg finishes a segment and the file is safe to upload.
         """
         self.cfg = cfg
         self.on_chunk_complete = on_chunk_complete
         self._process: Optional[subprocess.Popen] = None
         self._monitor_thread: Optional[threading.Thread] = None
         self._surgery_id: Optional[str] = None
-        self._output_dir: Optional[Path] = None
-        self._segment_list_path: Optional[Path] = None
-        self._known_segments: set[str] = set()
+        self._streams: list[_StreamOutput] = []
+        self._known_segments: set[tuple[str, str]] = set()
         self._stop_event = threading.Event()
 
     @property
@@ -49,10 +64,21 @@ class FFmpegManager:
         self._stop_event.clear()
         self._known_segments = set()
 
-        self._output_dir = Path(self.cfg.chunk_dir) / surgery_id
-        self._output_dir.mkdir(parents=True, exist_ok=True)
-
-        self._segment_list_path = self._output_dir / "segments.csv"
+        base_dir = Path(self.cfg.chunk_dir) / surgery_id
+        self._streams = [
+            _StreamOutput(
+                variant=VARIANT_ORIGINAL,
+                output_dir=base_dir / VARIANT_ORIGINAL,
+                segment_list_path=base_dir / VARIANT_ORIGINAL / "segments.csv",
+            ),
+            _StreamOutput(
+                variant=VARIANT_PREVIEW,
+                output_dir=base_dir / VARIANT_PREVIEW,
+                segment_list_path=base_dir / VARIANT_PREVIEW / "segments.csv",
+            ),
+        ]
+        for stream in self._streams:
+            stream.output_dir.mkdir(parents=True, exist_ok=True)
 
         cmd = self._build_ffmpeg_cmd()
         logger.info(f"Starting ffmpeg: {' '.join(cmd)}")
@@ -102,14 +128,28 @@ class FFmpegManager:
             self._process.wait()
             return False
         finally:
-            # Do one final segment scan to pick up the last chunk
-            self._scan_segment_list()
+            self._scan_all_segment_lists()
             self._process = None
             self._surgery_id = None
+            self._streams = []
 
     def _build_ffmpeg_cmd(self) -> list[str]:
         cfg = self.cfg
-        output_pattern = str(self._output_dir / "%Y%m%d_%H%M%S.mp4")
+        original = self._streams[0]
+        preview = self._streams[1]
+        original_pattern = str(original.output_dir / "%Y%m%d_%H%M%S.mp4")
+        preview_pattern = str(preview.output_dir / "%Y%m%d_%H%M%S.mp4")
+        preview_vf = f"fps={cfg.preview_fps},scale=-2:{cfg.preview_height}"
+
+        segment_opts = [
+            "-f", "segment",
+            "-segment_time", str(cfg.chunk_duration_seconds),
+            "-segment_format", "mp4",
+            "-reset_timestamps", "1",
+            "-strftime", "1",
+            "-segment_list_type", "csv",
+            "-segment_list_flags", "+cache",
+        ]
 
         return [
             "ffmpeg",
@@ -119,39 +159,38 @@ class FFmpegManager:
             "-framerate", str(cfg.video_fps),
             "-i", cfg.camera_device,
 
-            # Encoding
+            # Original — full resolution
+            "-map", "0:v",
+            "-an",
             "-c:v", "libx264",
             "-preset", "fast",
-            "-crf", "23",
+            "-crf", str(cfg.video_crf),
+            *segment_opts,
+            "-segment_list", str(original.segment_list_path),
+            original_pattern,
 
-            # Segmentation
-            "-f", "segment",
-            "-segment_time", str(cfg.chunk_duration_seconds),
-            "-segment_format", "mp4",
-            "-reset_timestamps", "1",
-            "-strftime", "1",
-
-            # Segment list — completed segments are written here
-            "-segment_list", str(self._segment_list_path),
-            "-segment_list_type", "csv",
-            "-segment_list_flags", "+cache",  # append, don't overwrite
-
-            output_pattern,
+            # Preview — drop to 1 fps before scale to minimize CPU
+            "-map", "0:v",
+            "-an",
+            "-vf", preview_vf,
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", str(cfg.preview_crf),
+            *segment_opts,
+            "-segment_list", str(preview.segment_list_path),
+            preview_pattern,
         ]
 
     def _monitor_segments(self):
         """
-        Polls the segment list CSV for newly completed segments.
-        ffmpeg appends a line to the CSV when it closes a segment file,
-        so any line we haven't seen before is a completed, safe-to-upload chunk.
-
-        CSV format: filename,start_time,end_time
+        Polls segment list CSVs for newly completed segments.
+        ffmpeg appends a line when it closes a segment file.
         """
         import time
-        while not self._stop_event.is_set():
-            self._scan_segment_list()
 
-            # Also check if ffmpeg died unexpectedly
+        while not self._stop_event.is_set():
+            self._scan_all_segment_lists()
+
             if self._process and self._process.poll() is not None:
                 exit_code = self._process.returncode
                 if not self._stop_event.is_set():
@@ -160,35 +199,55 @@ class FFmpegManager:
 
             time.sleep(2)
 
-    def _scan_segment_list(self):
-        if not self._segment_list_path or not self._segment_list_path.exists():
+    def _scan_all_segment_lists(self):
+        for stream in self._streams:
+            self._scan_segment_list(stream)
+
+    def _scan_segment_list(self, stream: _StreamOutput):
+        path = stream.segment_list_path
+        if not path.exists():
             return
 
         try:
-            lines = self._segment_list_path.read_text().strip().splitlines()
+            lines = path.read_text().strip().splitlines()
         except OSError:
             return
 
-        for line in lines:
+        for chunk_sequence, line in enumerate(lines, start=1):
             parts = line.strip().split(",")
-            if len(parts) < 1:
+            if not parts:
                 continue
             filename = parts[0].strip()
-            if not filename or filename in self._known_segments:
+            if not filename:
                 continue
 
-            full_path = str(self._output_dir / filename) if not os.path.isabs(filename) else filename
+            key = (stream.variant, filename)
+            if key in self._known_segments:
+                continue
+
+            full_path = (
+                str(stream.output_dir / filename)
+                if not os.path.isabs(filename)
+                else filename
+            )
             if not os.path.exists(full_path):
                 continue
 
-            self._known_segments.add(filename)
+            self._known_segments.add(key)
             recorded_at = datetime.now(timezone.utc).isoformat()
-            logger.info(f"Chunk complete: {full_path}")
+            logger.info(f"Chunk complete [{stream.variant}]: {full_path}")
 
             try:
-                self.on_chunk_complete(full_path, recorded_at)
+                self.on_chunk_complete(
+                    full_path,
+                    recorded_at,
+                    stream.variant,
+                    chunk_sequence,
+                )
             except Exception:
-                logger.exception(f"Error in on_chunk_complete callback for {full_path}")
+                logger.exception(
+                    f"Error in on_chunk_complete for {stream.variant} {full_path}"
+                )
 
     def _log_ffmpeg_stderr(self):
         """Stream ffmpeg stderr to our logger at DEBUG level."""
