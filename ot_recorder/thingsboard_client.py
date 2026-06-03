@@ -222,17 +222,20 @@ class ThingsBoardClient:
                 return {"ok": False, "error": "scheduled_duration_minutes must be an integer"}
 
         state = self.get_status()
-        if state.get("status") == "recording":
+        if state.get("status") != "idle":
             return {
                 "ok": False,
-                "error": f"Already recording surgery {state.get('surgery_id')}",
+                "error": (
+                    f"Cannot start: recorder is {state.get('status')} "
+                    f"(surgery {state.get('surgery_id') or 'none'})"
+                ),
             }
 
         logger.info(f"Start RPC for surgery {surgery_id}")
         self.on_start(surgery_id, duration)
         return {
             "ok": True,
-            "message": "Recording started",
+            "message": "Recording start accepted",
             "surgery_id": surgery_id,
         }
 
@@ -242,7 +245,21 @@ class ThingsBoardClient:
             return {"ok": False, "error": "surgery_id is required"}
 
         state = self.get_status()
-        if state.get("status") != "recording":
+        if state.get("status") == "stopping":
+            if state.get("surgery_id") == surgery_id:
+                return {
+                    "ok": True,
+                    "message": "Recording stop already in progress",
+                    "surgery_id": surgery_id,
+                }
+            return {
+                "ok": False,
+                "error": (
+                    f"Stop in progress for surgery {state.get('surgery_id')}, "
+                    f"not {surgery_id}"
+                ),
+            }
+        if state.get("status") not in ("recording", "starting"):
             return {"ok": False, "error": "Not currently recording"}
         if state.get("surgery_id") != surgery_id:
             return {
@@ -257,7 +274,7 @@ class ThingsBoardClient:
         self.on_stop(surgery_id)
         return {
             "ok": True,
-            "message": "Recording stopped",
+            "message": "Recording stop accepted",
             "surgery_id": surgery_id,
         }
 

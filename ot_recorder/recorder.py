@@ -10,9 +10,9 @@ Lifecycle:
   4. Start uploader thread
   5. Connect to ThingsBoard (MQTT RPC)
   6. Wait for startRecording RPC
-  7. On start: begin recording, ffmpeg chunks → uploader
-  8. On stop: stop ffmpeg cleanly, drain uploader
-  9. On SIGTERM: same as stop, then exit
+  7. On start RPC: accept immediately, begin recording in background
+  8. On stop RPC: accept immediately, stop ffmpeg and drain uploads in background
+  9. On SIGTERM: trigger stop and wait briefly for background work, then exit
 """
 
 import logging
@@ -45,74 +45,133 @@ class Recorder:
         self.ffmpeg = FFmpegManager(self.cfg, on_chunk_complete=self._on_chunk_complete)
         self.thingsboard = ThingsBoardClient(
             cfg=self.cfg,
-            on_start=self._on_start,
-            on_stop=self._on_stop,
+            on_start=self.trigger_start,
+            on_stop=self.trigger_stop,
             get_status=self._get_status,
         )
 
         self._current_surgery_id: Optional[str] = None
         self._chunk_sequence: int = 0
-        self._state: str = "idle"  # idle | recording | stopping
+        self._state: str = "idle"  # idle | starting | recording | stopping
         self._state_lock = threading.Lock()
         self._shutdown_event = threading.Event()
+        self._auto_stop_timer: Optional[threading.Timer] = None
+        self._worker_thread: Optional[threading.Thread] = None
 
     # -------------------------------------------------------------------------
-    # Start / stop (called by ThingsBoard RPC handler)
+    # Start / stop triggers (return immediately; work runs in background)
     # -------------------------------------------------------------------------
 
-    def _on_start(self, surgery_id: str, scheduled_duration_minutes: Optional[int]):
+    def trigger_start(self, surgery_id: str, scheduled_duration_minutes: Optional[int]):
         with self._state_lock:
+            if self._state != "idle":
+                logger.warning(
+                    f"Start ignored for {surgery_id}: recorder is {self._state}"
+                )
+                return
             self._current_surgery_id = surgery_id
             self._chunk_sequence = 0
-            self._state = "recording"
+            self._state = "starting"
 
-        self.manifest.start_session(
-            surgery_id=surgery_id,
-            ot_location_id=self.cfg.ot_location_id,
-            hospital_id=self.cfg.ot_hospital_id,
-        )
-        self.ffmpeg.start(surgery_id)
-        logger.info(f"Recording started for surgery {surgery_id}")
+        logger.info(f"Recording start accepted for surgery {surgery_id}")
         self.thingsboard.publish_status()
+        self._spawn_worker(
+            "record-start",
+            self._run_start,
+            (surgery_id, scheduled_duration_minutes),
+        )
 
-        if scheduled_duration_minutes:
-            # Auto-stop after scheduled duration as a safety net
-            # ThingsBoard should also send stopRecording, but this ensures
-            # we don't record forever if the stop signal is lost
-            stop_after = scheduled_duration_minutes * 60 + 300  # +5 min grace
-            t = threading.Timer(stop_after, self._auto_stop, args=[surgery_id])
-            t.daemon = True
-            t.start()
-            logger.info(f"Auto-stop scheduled in {stop_after}s")
-
-    def _on_stop(self, surgery_id: str):
+    def trigger_stop(self, surgery_id: str):
         with self._state_lock:
-            if self._state != "recording":
+            if self._state == "stopping":
+                logger.info(f"Stop already in progress for {surgery_id}")
+                return
+            if self._state not in ("recording", "starting"):
+                logger.warning(
+                    f"Stop ignored for {surgery_id}: recorder is {self._state}"
+                )
+                return
+            if self._current_surgery_id != surgery_id:
+                logger.warning(
+                    f"Stop ignored: active surgery is {self._current_surgery_id}, "
+                    f"not {surgery_id}"
+                )
                 return
             self._state = "stopping"
 
-        logger.info(f"Stopping recording for surgery {surgery_id}...")
-        self.ffmpeg.stop()
-        logger.info("ffmpeg stopped, waiting for upload queue to drain...")
-
-        # Wait for uploader to process everything currently in the queue
-        self._wait_for_uploads(surgery_id, timeout=300)
-
-        self.manifest.stop_session(surgery_id)
-
-        with self._state_lock:
-            self._current_surgery_id = None
-            self._state = "idle"
-
-        logger.info(f"Recording complete for surgery {surgery_id}")
+        self._cancel_auto_stop_timer()
+        logger.info(f"Recording stop accepted for surgery {surgery_id}")
         self.thingsboard.publish_status()
+        self._spawn_worker("record-stop", self._run_stop, (surgery_id,))
+
+    def _spawn_worker(self, name: str, target, args: tuple):
+        thread = threading.Thread(target=target, args=args, name=name, daemon=True)
+        self._worker_thread = thread
+        thread.start()
+
+    def _run_start(self, surgery_id: str, scheduled_duration_minutes: Optional[int]):
+        try:
+            self.manifest.start_session(
+                surgery_id=surgery_id,
+                ot_location_id=self.cfg.ot_location_id,
+                hospital_id=self.cfg.ot_hospital_id,
+            )
+            self.ffmpeg.start(surgery_id)
+            with self._state_lock:
+                if self._state != "starting":
+                    logger.info(
+                        f"Start aborted for {surgery_id}: state is {self._state}"
+                    )
+                    self.ffmpeg.stop()
+                    return
+                self._state = "recording"
+            logger.info(f"Recording started for surgery {surgery_id}")
+            self.thingsboard.publish_status()
+
+            if scheduled_duration_minutes:
+                stop_after = scheduled_duration_minutes * 60 + 300  # +5 min grace
+                self._auto_stop_timer = threading.Timer(
+                    stop_after, self._auto_stop, args=[surgery_id]
+                )
+                self._auto_stop_timer.daemon = True
+                self._auto_stop_timer.start()
+                logger.info(f"Auto-stop scheduled in {stop_after}s")
+        except Exception:
+            logger.exception(f"Failed to start recording for surgery {surgery_id}")
+            self._cancel_auto_stop_timer()
+            with self._state_lock:
+                self._current_surgery_id = None
+                self._state = "idle"
+            self.thingsboard.publish_status()
+
+    def _run_stop(self, surgery_id: str):
+        try:
+            logger.info(f"Stopping recording for surgery {surgery_id}...")
+            self.ffmpeg.stop()
+            logger.info("ffmpeg stopped, waiting for upload queue to drain...")
+            self._wait_for_uploads(surgery_id, timeout=300)
+            self.manifest.stop_session(surgery_id)
+            with self._state_lock:
+                self._current_surgery_id = None
+                self._state = "idle"
+            logger.info(f"Recording complete for surgery {surgery_id}")
+        except Exception:
+            logger.exception(f"Failed to stop recording for surgery {surgery_id}")
+            with self._state_lock:
+                self._state = "idle"
+        finally:
+            self.thingsboard.publish_status()
+
+    def _cancel_auto_stop_timer(self):
+        if self._auto_stop_timer:
+            self._auto_stop_timer.cancel()
+            self._auto_stop_timer = None
 
     def _auto_stop(self, surgery_id: str):
-        logger.warning(f"Auto-stop triggered for surgery {surgery_id} (scheduled duration exceeded)")
-        with self._state_lock:
-            if self._current_surgery_id != surgery_id or self._state != "recording":
-                return
-        self._on_stop(surgery_id)
+        logger.warning(
+            f"Auto-stop triggered for surgery {surgery_id} (scheduled duration exceeded)"
+        )
+        self.trigger_stop(surgery_id)
 
     # -------------------------------------------------------------------------
     # Chunk callback (called from ffmpeg monitor thread)
@@ -188,8 +247,8 @@ class Recorder:
                 surgery_id = self._current_surgery_id
                 state = self._state
 
-            if state == "recording" and surgery_id:
-                self._on_stop(surgery_id)
+            if state in ("recording", "starting") and surgery_id:
+                self.trigger_stop(surgery_id)
 
             self._shutdown_event.set()
 
@@ -241,6 +300,10 @@ class Recorder:
         self._shutdown_event.wait()
 
         logger.info("Shutting down...")
+        self._cancel_auto_stop_timer()
+        if self._worker_thread and self._worker_thread.is_alive():
+            logger.info("Waiting for in-flight start/stop work...")
+            self._worker_thread.join(timeout=330)
         self.thingsboard.stop()
         self.uploader.stop(drain_timeout=120)
         logger.info("Recorder exited cleanly")
