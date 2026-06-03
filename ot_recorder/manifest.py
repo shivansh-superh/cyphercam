@@ -10,6 +10,10 @@ Chunk states:
   uploading — upload in progress (if we crash here, treat as pending on restart)
   complete  — S3 confirmed, local file deleted
   failed    — permanent failure after all retries (needs manual intervention)
+
+Preview chunks also track analyze_status (surgery_id is the IPD appointment id):
+  pending   — uploaded, analyze-ot-video not yet confirmed
+  complete  — analyze-ot-video succeeded
 """
 
 import sqlite3
@@ -80,6 +84,17 @@ class Manifest:
                     ON chunks(surgery_id);
             """)
             self._migrate_chunks_schema(conn)
+            self._migrate_analyze_status(conn)
+
+    def _migrate_analyze_status(self, conn: sqlite3.Connection):
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(chunks)")}
+        if "analyze_status" in cols:
+            return
+
+        logger.info("Migrating manifest: adding chunk analyze_status column")
+        conn.execute(
+            "ALTER TABLE chunks ADD COLUMN analyze_status TEXT"
+        )
 
     def _migrate_chunks_schema(self, conn: sqlite3.Connection):
         """Add variant column and unique constraint for DBs created before dual output."""
@@ -181,12 +196,38 @@ class Manifest:
                 "UPDATE chunks SET status='uploading' WHERE id=?", (chunk_id,)
             )
 
-    def mark_complete(self, chunk_id: int, s3_key: str):
+    def mark_complete(self, chunk_id: int, s3_key: str, *, needs_analyze: bool = False):
+        analyze_status = "pending" if needs_analyze else None
         with self._conn() as conn:
             conn.execute(
-                "UPDATE chunks SET status='complete', s3_key=?, uploaded_at=? WHERE id=?",
-                (s3_key, _now(), chunk_id),
+                """
+                UPDATE chunks
+                SET status='complete', s3_key=?, uploaded_at=?, analyze_status=?
+                WHERE id=?
+                """,
+                (s3_key, _now(), analyze_status, chunk_id),
             )
+
+    def mark_analyze_complete(self, chunk_id: int):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE chunks SET analyze_status='complete' WHERE id=?",
+                (chunk_id,),
+            )
+
+    def get_pending_analyze_chunks(self) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM chunks
+                WHERE status='complete'
+                  AND variant='preview'
+                  AND analyze_status='pending'
+                  AND s3_key IS NOT NULL
+                ORDER BY surgery_id, chunk_sequence
+                """
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def migrate_legacy_uploaded(self) -> list[str]:
         """Upgrade legacy 'uploaded' rows to complete and return local paths to clean up."""

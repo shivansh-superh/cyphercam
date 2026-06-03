@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
+from .ai_pipeline import trigger_analyze
 from .config import Config
 from .manifest import Manifest
 
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 5
 RETRY_BASE_DELAY = 5   # seconds
 RETRY_MAX_DELAY = 120  # seconds
+VARIANT_PREVIEW = "preview"
 
 
 @dataclass
@@ -109,6 +111,8 @@ class Uploader:
                 recorded_at=chunk["recorded_at"] or "",
             )
 
+        self._retry_pending_analyze()
+
     def _run(self):
         while True:
             job = self._queue.get()
@@ -124,11 +128,18 @@ class Uploader:
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 self._upload_to_s3(job, s3_key)
-                self.manifest.mark_complete(job.chunk_id, s3_key)
+                needs_analyze = (
+                    job.variant == VARIANT_PREVIEW and self._ai_pipeline_configured()
+                )
+                self.manifest.mark_complete(
+                    job.chunk_id, s3_key, needs_analyze=needs_analyze
+                )
                 logger.info(
                     f"Uploaded chunk {job.chunk_sequence} ({job.variant}) → "
                     f"s3://{self.cfg.s3_bucket}/{s3_key}"
                 )
+                if needs_analyze:
+                    self._trigger_preview_analysis(job.chunk_id, job.surgery_id, s3_key)
                 self._delete_local_file(job.local_path)
                 return
 
@@ -183,6 +194,55 @@ class Uploader:
             f"{job.variant}/"
             f"{filename}"
         )
+
+    def _ai_pipeline_configured(self) -> bool:
+        return bool(self.cfg.ai_pipeline_base_url and self.cfg.ai_pipeline_api_key)
+
+    def _generate_presigned_url(self, s3_key: str) -> str:
+        return self._s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": self.cfg.s3_bucket, "Key": s3_key},
+            ExpiresIn=self.cfg.ai_pipeline_presigned_url_expiry,
+        )
+
+    def _video_id_for_s3_key(self, surgery_id: str, s3_key: str) -> str:
+        filename_stem = os.path.splitext(os.path.basename(s3_key))[0]
+        return f"{surgery_id}-{filename_stem}"
+
+    def _trigger_preview_analysis(
+        self, chunk_id: int, surgery_id: str, s3_key: str
+    ) -> bool:
+        video_id = self._video_id_for_s3_key(surgery_id, s3_key)
+        presigned_url = self._generate_presigned_url(s3_key)
+
+        if trigger_analyze(
+            self.cfg,
+            video_id=video_id,
+            presigned_url=presigned_url,
+            ipd_appointment_id=surgery_id,
+        ):
+            self.manifest.mark_analyze_complete(chunk_id)
+            return True
+        return False
+
+    def _retry_pending_analyze(self):
+        pending = self.manifest.get_pending_analyze_chunks()
+        if not pending:
+            return
+        if not self._ai_pipeline_configured():
+            logger.debug(
+                "AI pipeline not configured — %d preview chunks remain analyze-pending",
+                len(pending),
+            )
+            return
+
+        logger.info(
+            f"Retrying AI pipeline analyze for {len(pending)} preview chunks"
+        )
+        for chunk in pending:
+            self._trigger_preview_analysis(
+                chunk["id"], chunk["surgery_id"], chunk["s3_key"]
+            )
 
     def _delete_local_file(self, path: str):
         try:

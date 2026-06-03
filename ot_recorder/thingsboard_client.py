@@ -4,6 +4,7 @@ ThingsBoard MQTT client.
 Connects outbound to ThingsBoard and handles server-side RPC:
   startRecording  { "surgery_id": "...", "scheduled_duration_minutes": 180 }
                   (alias: duration_minutes)
+                  surgery_id is the IPD appointment id
   stopRecording   { "surgery_id": "..." }
 
 Publishes recorder status as device telemetry on connect and after each RPC.
