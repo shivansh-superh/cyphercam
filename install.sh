@@ -26,7 +26,7 @@ SERVICE_GROUP="$(id -gn "$SERVICE_USER")"
 
 echo "==> Installing system dependencies"
 apt-get update -qq
-apt-get install -y ffmpeg python3-pip python3-venv
+apt-get install -y ffmpeg fonts-dejavu-core python3-pip python3-venv
 
 echo "==> Creating service user directories"
 mkdir -p /etc/ot-agent

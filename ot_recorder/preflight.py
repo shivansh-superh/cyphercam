@@ -43,6 +43,15 @@ def check_disk_space(cfg: Config):
     logger.info(f"Disk check passed: {free_mb}MB free")
 
 
+def check_preview_timestamp_font(cfg: Config):
+    if not os.path.isfile(cfg.preview_timestamp_font):
+        raise PreflightError(
+            f"Preview timestamp font not found: {cfg.preview_timestamp_font}. "
+            "Install fonts-dejavu-core or set PREVIEW_TIMESTAMP_FONT."
+        )
+    logger.info(f"Timestamp font check passed: {cfg.preview_timestamp_font}")
+
+
 def check_ffmpeg():
     if not shutil.which("ffmpeg"):
         raise PreflightError(
@@ -54,6 +63,7 @@ def check_ffmpeg():
 def run_all(cfg: Config):
     logger.info("Running preflight checks...")
     check_ffmpeg()
+    check_preview_timestamp_font(cfg)
     check_camera(cfg)
     check_disk_space(cfg)
     logger.info("All preflight checks passed.")
@@ -72,6 +82,7 @@ def wait_until_ready(
     check_ffmpeg()
     while not shutdown_event.is_set():
         try:
+            check_preview_timestamp_font(cfg)
             check_camera(cfg)
             check_disk_space(cfg)
             logger.info("All preflight checks passed.")

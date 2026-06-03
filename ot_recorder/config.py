@@ -38,6 +38,7 @@ class Config:
     preview_height: int
     preview_fps: int
     preview_crf: int
+    preview_timestamp_font: str
     chunk_duration_seconds: int
     chunk_dir: str
     manifest_path: str
@@ -90,6 +91,10 @@ def load_config() -> Config:
         preview_height=int(os.environ.get("PREVIEW_HEIGHT", "720")),
         preview_fps=int(os.environ.get("PREVIEW_FPS", "1")),
         preview_crf=int(os.environ.get("PREVIEW_CRF", "28")),
+        preview_timestamp_font=os.environ.get(
+            "PREVIEW_TIMESTAMP_FONT",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ),
         chunk_duration_seconds=int(os.environ.get("CHUNK_DURATION_SECONDS", "300")),
         chunk_dir=os.environ.get("CHUNK_DIR", "/tmp/ot-chunks"),
         manifest_path=os.environ.get("MANIFEST_PATH", "/var/lib/ot-recorder/manifest.db"),

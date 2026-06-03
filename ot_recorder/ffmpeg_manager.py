@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 VARIANT_ORIGINAL = "original"
 VARIANT_PREVIEW = "preview"
 
+# drawtext localtime format; colons escaped for ffmpeg filter syntax
+_DRAWTEXT_TIME = r"%{localtime\:%Y-%m-%d %H\:%M\:%S}"
+
 
 @dataclass(frozen=True)
 class _StreamOutput:
@@ -139,7 +142,7 @@ class FFmpegManager:
         preview = self._streams[1]
         original_pattern = str(original.output_dir / "%Y%m%d_%H%M%S.mp4")
         preview_pattern = str(preview.output_dir / "%Y%m%d_%H%M%S.mp4")
-        preview_vf = f"fps={cfg.preview_fps},scale=-2:{cfg.preview_height}"
+        preview_vf = self._build_preview_video_filter(cfg)
 
         segment_opts = [
             "-f", "segment",
@@ -180,6 +183,16 @@ class FFmpegManager:
             "-segment_list", str(preview.segment_list_path),
             preview_pattern,
         ]
+
+    def _build_preview_video_filter(self, cfg: Config) -> str:
+        """1 fps preview at 720p with wall-clock timestamp (preview only)."""
+        font = cfg.preview_timestamp_font.replace(":", r"\:")
+        drawtext = (
+            f"drawtext=fontfile={font}:text='{_DRAWTEXT_TIME}'"
+            ":fontcolor=orange:borderw=2:bordercolor=black:fontsize=22"
+            ":x=w-tw-12:y=h-th-12"
+        )
+        return f"fps={cfg.preview_fps},scale=-2:{cfg.preview_height},{drawtext}"
 
     def _monitor_segments(self):
         """
