@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 VARIANT_ORIGINAL = "original"
 VARIANT_PREVIEW = "preview"
 
-# drawtext localtime format; colons escaped for ffmpeg filter syntax
-_DRAWTEXT_TIME = r"%{localtime\:%Y-%m-%d %H\:%M\:%S}"
+# Default FFmpeg localtime format (no fmt arg — colons in fmt break filter parsing on 6.x)
+_DRAWTEXT_TIME = r"%{localtime}"
 
 
 @dataclass(frozen=True)
@@ -189,7 +189,7 @@ class FFmpegManager:
         font = cfg.preview_timestamp_font.replace(":", r"\:")
         drawtext = (
             f"drawtext=fontfile={font}:text='{_DRAWTEXT_TIME}'"
-            ":fontcolor=orange:borderw=2:bordercolor=black:fontsize=22"
+            ":fontcolor=0xFFA500:borderw=2:bordercolor=black:fontsize=22"
             ":x=w-tw-12:y=h-th-12"
         )
         return f"fps={cfg.preview_fps},scale=-2:{cfg.preview_height},{drawtext}"
@@ -269,4 +269,4 @@ class FFmpegManager:
         for line in self._process.stderr:
             decoded = line.decode("utf-8", errors="replace").rstrip()
             if decoded:
-                logger.debug(f"[ffmpeg] {decoded}")
+                logger.info(f"[ffmpeg] {decoded}")
