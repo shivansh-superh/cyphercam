@@ -2,8 +2,8 @@
 Manages the ffmpeg subprocess.
 
 ffmpeg writes two segmented streams per surgery:
-  {chunk_dir}/{surgery_id}/original/YYYYMMDD_HHMMSS.mp4  — full resolution
-  {chunk_dir}/{surgery_id}/preview/YYYYMMDD_HHMMSS.mp4   — 720p @ 1 fps
+  {chunk_dir}/{surgery_id}/original/YYYYMMDD_HHMMSS.mp4  — camera MJPEG, stream copy
+  {chunk_dir}/{surgery_id}/preview/YYYYMMDD_HHMMSS.mp4   — decode → 1 fps → 720p → H264
 
 Each stream has its own segment list CSV; chunk_sequence is the 1-based line
 index in that CSV so original and preview rows with the same filename stem align.
@@ -162,12 +162,10 @@ class FFmpegManager:
             "-framerate", str(cfg.video_fps),
             "-i", cfg.camera_device,
 
-            # Original — full resolution
+            # Original — remux camera MJPEG without re-encode (avoids CPU saturation)
             "-map", "0:v",
             "-an",
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", str(cfg.video_crf),
+            "-c:v", "copy",
             *segment_opts,
             "-segment_list", str(original.segment_list_path),
             original_pattern,
