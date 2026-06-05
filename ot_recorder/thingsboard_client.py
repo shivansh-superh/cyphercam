@@ -8,6 +8,8 @@ Connects outbound to ThingsBoard and handles server-side RPC:
   stopRecording   { "surgery_id": "..." }
 
 Publishes recorder status as device telemetry on connect and after each RPC.
+After each preview chunk upload, publishes analyze payload (video_id, presigned_url,
+ipd_appointment_id) on the same telemetry topic for downstream rule processing.
 """
 
 import json
@@ -51,11 +53,13 @@ class ThingsBoardClient:
         on_start: Callable[[str, Optional[int]], None],
         on_stop: Callable[[str], None],
         get_status: Callable[[], dict],
+        on_connected: Callable[[], None] | None = None,
     ):
         self.cfg = cfg
         self.on_start = on_start
         self.on_stop = on_stop
         self.get_status = get_status
+        self.on_connected = on_connected
         self._client: Optional[mqtt.Client] = None
         self._stop_event = threading.Event()
         self._connected = threading.Event()
@@ -77,6 +81,37 @@ class ThingsBoardClient:
     def publish_status(self):
         """Push current recorder state to ThingsBoard telemetry (best-effort)."""
         self._publish_telemetry()
+
+    def publish_analyze_ot_video(
+        self,
+        *,
+        video_id: str,
+        presigned_url: str,
+        ipd_appointment_id: str,
+    ) -> bool:
+        """
+        Notify downstream consumers (e.g. AI pipeline via TB rule chain) that a
+        preview chunk is ready. Uses the same fields as analyze-ot-video REST API.
+        """
+        payload = {
+            "video_id": video_id,
+            "presigned_url": presigned_url,
+            "ipd_appointment_id": ipd_appointment_id,
+        }
+        if self._publish_json(TELEMETRY_TOPIC, payload):
+            logger.info(
+                "Published analyze-ot-video telemetry for video_id=%s "
+                "ipd_appointment_id=%s",
+                video_id,
+                ipd_appointment_id,
+            )
+            return True
+        logger.warning(
+            "Failed to publish analyze-ot-video telemetry for video_id=%s "
+            "(ThingsBoard not connected)",
+            video_id,
+        )
+        return False
 
     def stop(self):
         self._stop_event.set()
@@ -167,6 +202,11 @@ class ThingsBoardClient:
             client.subscribe(RPC_SUBSCRIBE, qos=1)
             self._connected.set()
             self._publish_telemetry()
+            if self.on_connected:
+                try:
+                    self.on_connected()
+                except Exception:
+                    logger.exception("on_connected callback failed")
         finally:
             if hasattr(self, "_connect_outcome"):
                 self._connect_outcome.set()
@@ -285,9 +325,21 @@ class ThingsBoardClient:
         topic = f"{RPC_RESPONSE_PREFIX}{request_id}"
         self._client.publish(topic, json.dumps(payload), qos=1)
 
-    def _publish_telemetry(self):
+    def _publish_json(self, topic: str, payload: dict) -> bool:
         if not self._client or not self._client.is_connected():
-            return
+            return False
+        result = self._client.publish(topic, json.dumps(payload), qos=1)
+        if getattr(result, "rc", mqtt.MQTT_ERR_SUCCESS) != mqtt.MQTT_ERR_SUCCESS:
+            logger.error(
+                "MQTT publish to %s failed (rc=%s): %s",
+                topic,
+                getattr(result, "rc", None),
+                payload,
+            )
+            return False
+        return True
+
+    def _publish_telemetry(self):
         state = self.get_status()
         telemetry = {
             "status": state.get("status", "idle"),
@@ -295,8 +347,8 @@ class ThingsBoardClient:
             "ot_location_id": self.cfg.ot_location_id,
             "ot_location_name": self.cfg.ot_location_name,
         }
-        self._client.publish(TELEMETRY_TOPIC, json.dumps(telemetry), qos=1)
-        logger.debug(f"Telemetry published: {telemetry}")
+        if self._publish_json(TELEMETRY_TOPIC, telemetry):
+            logger.debug(f"Telemetry published: {telemetry}")
 
 
 def _parse_params(params: Any) -> dict:

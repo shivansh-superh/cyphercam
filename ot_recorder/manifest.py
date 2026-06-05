@@ -12,8 +12,8 @@ Chunk states:
   failed    — permanent failure after all retries (needs manual intervention)
 
 Preview chunks also track analyze_status (surgery_id is the IPD appointment id):
-  pending   — uploaded, analyze-ot-video not yet confirmed
-  complete  — analyze-ot-video succeeded
+  pending   — uploaded, analyze telemetry not yet confirmed on ThingsBoard
+  complete  — analyze telemetry published successfully
 """
 
 import sqlite3

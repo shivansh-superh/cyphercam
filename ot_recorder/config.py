@@ -45,9 +45,7 @@ class Config:
 
     min_free_disk_mb: int
 
-    ai_pipeline_base_url: str | None
-    ai_pipeline_api_key: str | None
-    ai_pipeline_presigned_url_expiry: int
+    presigned_url_expiry: int
 
 
 def _normalize_tb_host(raw: str) -> str:
@@ -105,9 +103,10 @@ def load_config() -> Config:
 
         min_free_disk_mb=int(os.environ.get("MIN_FREE_DISK_MB", "2048")),
 
-        ai_pipeline_base_url=os.environ.get("AI_PIPELINE_BASE_URL") or None,
-        ai_pipeline_api_key=os.environ.get("AI_PIPELINE_API_KEY") or None,
-        ai_pipeline_presigned_url_expiry=int(
-            os.environ.get("AI_PIPELINE_PRESIGNED_URL_EXPIRY", "3600")
+        presigned_url_expiry=int(
+            os.environ.get(
+                "PREVIEW_PRESIGNED_URL_EXPIRY",
+                os.environ.get("AI_PIPELINE_PRESIGNED_URL_EXPIRY", "3600"),
+            )
         ),
     )

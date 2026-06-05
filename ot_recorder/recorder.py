@@ -41,14 +41,15 @@ class Recorder:
     def __init__(self):
         self.cfg = load_config()
         self.manifest = Manifest(self.cfg.manifest_path)
-        self.uploader = Uploader(self.cfg, self.manifest)
-        self.ffmpeg = FFmpegManager(self.cfg, on_chunk_complete=self._on_chunk_complete)
         self.thingsboard = ThingsBoardClient(
             cfg=self.cfg,
             on_start=self.trigger_start,
             on_stop=self.trigger_stop,
             get_status=self._get_status,
         )
+        self.uploader = Uploader(self.cfg, self.manifest, self.thingsboard)
+        self.thingsboard.on_connected = self.uploader.retry_pending_analyze
+        self.ffmpeg = FFmpegManager(self.cfg, on_chunk_complete=self._on_chunk_complete)
 
         self._current_surgery_id: Optional[str] = None
         self._state: str = "idle"  # idle | starting | recording | stopping

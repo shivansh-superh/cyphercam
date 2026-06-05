@@ -267,4 +267,4 @@ class FFmpegManager:
         for line in self._process.stderr:
             decoded = line.decode("utf-8", errors="replace").rstrip()
             if decoded:
-                logger.info(f"[ffmpeg] {decoded}")
+                logger.debug(f"[ffmpeg] {decoded}")
