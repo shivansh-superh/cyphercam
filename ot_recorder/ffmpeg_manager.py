@@ -167,9 +167,11 @@ class FFmpegManager:
             "-framerate", str(cfg.video_fps),
             "-i", cfg.camera_device,
 
-            # Original — hardware H.264 via Pi VPU (h264_v4l2m2m), offloads encoding from CPU
+            # Original — hardware H.264 via Pi VPU (h264_v4l2m2m), offloads encoding from CPU.
+            # bcm2835-codec requires yuv420p; MJPEG decodes to yuvj422p so we convert explicitly.
             "-map", "0:v",
             "-an",
+            "-vf", "format=yuv420p",
             "-c:v", "h264_v4l2m2m",
             "-b:v", f"{cfg.original_video_bitrate_kbps}k",
             "-bufsize", f"{cfg.original_video_bitrate_kbps * 2}k",
