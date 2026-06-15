@@ -34,7 +34,7 @@ class Config:
     video_width: int
     video_height: int
     video_fps: int
-    video_crf: int
+    original_video_bitrate_kbps: int
     preview_height: int
     preview_fps: int
     preview_crf: int
@@ -89,7 +89,7 @@ def load_config() -> Config:
         video_width=int(os.environ.get("VIDEO_WIDTH", "1920")),
         video_height=int(os.environ.get("VIDEO_HEIGHT", "1080")),
         video_fps=int(os.environ.get("VIDEO_FPS", "30")),
-        video_crf=int(os.environ.get("VIDEO_CRF", "23")),
+        original_video_bitrate_kbps=int(os.environ.get("VIDEO_BITRATE_KBPS", "4000")),
         preview_height=int(os.environ.get("PREVIEW_HEIGHT", "720")),
         preview_fps=int(os.environ.get("PREVIEW_FPS", "1")),
         preview_crf=int(os.environ.get("PREVIEW_CRF", "28")),

@@ -2,7 +2,7 @@
 Manages the ffmpeg subprocess.
 
 ffmpeg writes two segmented streams per surgery:
-  {chunk_dir}/{surgery_id}/original/YYYYMMDD_HHMMSS.mp4  — camera MJPEG, stream copy
+  {chunk_dir}/{surgery_id}/original/YYYYMMDD_HHMMSS.mp4  — MJPEG decode → H.264 via h264_v4l2m2m (Pi VPU)
   {chunk_dir}/{surgery_id}/preview/YYYYMMDD_HHMMSS.mp4   — decode → 1 fps → 720p → H264
 
 Each stream has its own segment list CSV; chunk_sequence is the 1-based line
@@ -144,6 +144,11 @@ class FFmpegManager:
         preview_pattern = str(preview.output_dir / "%Y%m%d_%H%M%S.mp4")
         preview_vf = self._build_preview_video_filter(cfg)
 
+        # Keyframe interval aligned to chunk boundaries so the segment muxer
+        # can cut at exactly chunk_duration_seconds without waiting for the next IDR.
+        original_gop = cfg.video_fps * cfg.chunk_duration_seconds
+        preview_gop = cfg.preview_fps * cfg.chunk_duration_seconds
+
         segment_opts = [
             "-f", "segment",
             "-segment_time", str(cfg.chunk_duration_seconds),
@@ -162,10 +167,13 @@ class FFmpegManager:
             "-framerate", str(cfg.video_fps),
             "-i", cfg.camera_device,
 
-            # Original — remux camera MJPEG without re-encode (avoids CPU saturation)
+            # Original — hardware H.264 via Pi VPU (h264_v4l2m2m), offloads encoding from CPU
             "-map", "0:v",
             "-an",
-            "-c:v", "copy",
+            "-c:v", "h264_v4l2m2m",
+            "-b:v", f"{cfg.original_video_bitrate_kbps}k",
+            "-bufsize", f"{cfg.original_video_bitrate_kbps * 2}k",
+            "-g", str(original_gop),
             *segment_opts,
             "-segment_list", str(original.segment_list_path),
             original_pattern,
@@ -177,6 +185,7 @@ class FFmpegManager:
             "-c:v", "libx264",
             "-preset", "ultrafast",
             "-crf", str(cfg.preview_crf),
+            "-g", str(preview_gop),
             *segment_opts,
             "-segment_list", str(preview.segment_list_path),
             preview_pattern,
