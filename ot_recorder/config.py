@@ -34,6 +34,7 @@ class Config:
     video_width: int
     video_height: int
     video_fps: int
+    video_codec: str
     original_video_bitrate_kbps: int
     preview_height: int
     preview_fps: int
@@ -86,10 +87,11 @@ def load_config() -> Config:
         tb_mqtt_ca_file=os.environ.get("TB_MQTT_CA_FILE") or None,
 
         camera_device=os.environ.get("CAMERA_DEVICE", "/dev/video0"),
-        video_width=int(os.environ.get("VIDEO_WIDTH", "1920")),
-        video_height=int(os.environ.get("VIDEO_HEIGHT", "1080")),
-        video_fps=int(os.environ.get("VIDEO_FPS", "30")),
-        original_video_bitrate_kbps=int(os.environ.get("VIDEO_BITRATE_KBPS", "4000")),
+        video_width=int(os.environ.get("VIDEO_WIDTH", "1280")),
+        video_height=int(os.environ.get("VIDEO_HEIGHT", "720")),
+        video_fps=int(os.environ.get("VIDEO_FPS", "15")),
+        video_codec=os.environ.get("VIDEO_CODEC", "hevc_v4l2m2m"),
+        original_video_bitrate_kbps=int(os.environ.get("VIDEO_BITRATE_KBPS", "1800")),
         preview_height=int(os.environ.get("PREVIEW_HEIGHT", "720")),
         preview_fps=int(os.environ.get("PREVIEW_FPS", "1")),
         preview_crf=int(os.environ.get("PREVIEW_CRF", "28")),
