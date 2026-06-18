@@ -33,6 +33,8 @@ RETRY_BASE_DELAY = 5   # seconds
 RETRY_MAX_DELAY = 120  # seconds
 VARIANT_PREVIEW = "preview"
 
+AI_ANALYSIS_ENABLED = False
+
 
 @dataclass
 class UploadJob:
@@ -135,7 +137,7 @@ class Uploader:
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 self._upload_to_s3(job, s3_key)
-                needs_analyze = job.variant == VARIANT_PREVIEW
+                needs_analyze = AI_ANALYSIS_ENABLED and job.variant == VARIANT_PREVIEW
                 self.manifest.mark_complete(
                     job.chunk_id, s3_key, needs_analyze=needs_analyze
                 )
@@ -227,6 +229,9 @@ class Uploader:
         return False
 
     def retry_pending_analyze(self):
+        if not AI_ANALYSIS_ENABLED:
+            return
+
         pending = self.manifest.get_pending_analyze_chunks()
         if not pending:
             return
