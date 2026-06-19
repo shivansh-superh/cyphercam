@@ -47,9 +47,21 @@ _DRAWTEXT_TIME = r"%{localtime}"
 
 # Linux fcntl constant — not exposed by name in the fcntl module.
 _F_SETPIPE_SZ = 1031
-# 4 MB gives remux a large window to absorb SD-card write stalls before capture
-# ever blocks and drops frames from the V4L2 buffer.
-_PIPE_BUF_SIZE = 4 * 1024 * 1024
+# Target pipe buffer size. Without CAP_SYS_RESOURCE a process cannot exceed
+# /proc/sys/fs/pipe-max-size (typically 1 MB on Pi OS). We clamp to that limit
+# so the enlargement always succeeds regardless of the service's capabilities.
+_PIPE_BUF_TARGET = 4 * 1024 * 1024
+
+
+def _pipe_buf_size() -> int:
+    """Return the pipe buffer size to request, capped at the system maximum."""
+    try:
+        max_size = int(
+            Path("/proc/sys/fs/pipe-max-size").read_text().strip()
+        )
+        return min(_PIPE_BUF_TARGET, max_size)
+    except OSError:
+        return _PIPE_BUF_TARGET
 
 
 @dataclass(frozen=True)
@@ -143,8 +155,9 @@ class FFmpegManager:
         # on other platforms (macOS dev machines, etc.).
         if self._capture.stdout:
             try:
-                fcntl.fcntl(self._capture.stdout.fileno(), _F_SETPIPE_SZ, _PIPE_BUF_SIZE)
-                logger.info(f"Pipe buffer set to {_PIPE_BUF_SIZE // 1024} KB")
+                buf_size = _pipe_buf_size()
+                fcntl.fcntl(self._capture.stdout.fileno(), _F_SETPIPE_SZ, buf_size)
+                logger.info(f"Pipe buffer set to {buf_size // 1024} KB")
             except OSError as exc:
                 logger.warning(f"Could not enlarge pipe buffer: {exc}")
 
