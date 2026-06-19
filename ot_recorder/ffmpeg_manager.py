@@ -170,9 +170,9 @@ class FFmpegManager:
             # Original — hardware encode via Pi VPU, offloads encoding from CPU.
             # bcm2835-codec requires yuv420p; MJPEG decodes to yuvj422p so we convert explicitly.
             # -g is silently ignored by v4l2m2m encoders, so we use -force_key_frames to guarantee
-            # an IDR at every segment boundary. -bsf:v dump_extra then injects the parameter sets
-            # (SPS/PPS for H.264, VPS/SPS/PPS for HEVC) into every IDR frame so that each segment
-            # file is self-contained and playable without reference to prior segments.
+            # an IDR at every segment boundary. repeatsequenceheader instructs the bcm2835-codec
+            # driver (via V4L2_CID_MPEG_VIDEO_REPEAT_SEQ_HEADER) to embed SPS/PPS before every IDR
+            # frame, making each segment file self-contained and independently decodable.
             "-map", "0:v",
             "-an",
             "-vf", "format=yuv420p",
@@ -182,6 +182,7 @@ class FFmpegManager:
             "-bufsize", f"{cfg.original_video_bitrate_kbps}k",
             "-g", str(original_gop),
             "-force_key_frames", f"expr:gte(t,n_forced*{cfg.chunk_duration_seconds})",
+            "-extra_ctrls", "repeatsequenceheader=1",
             "-bsf:v", "dump_extra",
             *segment_opts,
             "-segment_list", str(original.segment_list_path),
