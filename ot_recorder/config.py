@@ -36,6 +36,14 @@ class Config:
     video_fps: int
     video_codec: str
     original_video_bitrate_kbps: int
+    original_video_bufsize_kbps: int
+
+    audio_enabled: bool
+    audio_device: str
+    audio_sample_rate: int
+    audio_channels: int
+    audio_bitrate_kbps: int
+    preview_enabled: bool
     preview_height: int
     preview_fps: int
     preview_crf: int
@@ -92,6 +100,28 @@ def load_config() -> Config:
         video_fps=int(os.environ.get("VIDEO_FPS", "15")),
         video_codec=os.environ.get("VIDEO_CODEC", "hevc_v4l2m2m"),
         original_video_bitrate_kbps=int(os.environ.get("VIDEO_BITRATE_KBPS", "1800")),
+        original_video_bufsize_kbps=int(
+            os.environ.get(
+                "VIDEO_BUFSIZE_KBPS",
+                str(int(os.environ.get("VIDEO_BITRATE_KBPS", "1800")) * 2),
+            )
+        ),
+
+        audio_enabled=os.environ.get("AUDIO_ENABLED", "true").lower() in (
+            "1",
+            "true",
+            "yes",
+        ),
+        # Name-based ALSA id (stable across reboots, unlike the card index).
+        audio_device=os.environ.get("AUDIO_DEVICE", "plughw:CARD=O2,DEV=0"),
+        audio_sample_rate=int(os.environ.get("AUDIO_SAMPLE_RATE", "48000")),
+        audio_channels=int(os.environ.get("AUDIO_CHANNELS", "1")),
+        audio_bitrate_kbps=int(os.environ.get("AUDIO_BITRATE_KBPS", "128")),
+        preview_enabled=os.environ.get("PREVIEW_ENABLED", "true").lower() in (
+            "1",
+            "true",
+            "yes",
+        ),
         preview_height=int(os.environ.get("PREVIEW_HEIGHT", "720")),
         preview_fps=int(os.environ.get("PREVIEW_FPS", "1")),
         preview_crf=int(os.environ.get("PREVIEW_CRF", "28")),

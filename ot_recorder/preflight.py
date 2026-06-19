@@ -60,12 +60,25 @@ def check_ffmpeg():
     logger.info("ffmpeg check passed")
 
 
+def check_audio(cfg: Config):
+    """
+    Non-fatal: audio is best-effort. The mic is probed again at recording start,
+    where an unreachable device falls back to video-only. This just surfaces the
+    configured intent in the logs.
+    """
+    if not cfg.audio_enabled:
+        logger.info("Audio disabled (AUDIO_ENABLED=false)")
+        return
+    logger.info(f"Audio enabled — device {cfg.audio_device} (probed at record start)")
+
+
 def run_all(cfg: Config):
     logger.info("Running preflight checks...")
     check_ffmpeg()
     check_preview_timestamp_font(cfg)
     check_camera(cfg)
     check_disk_space(cfg)
+    check_audio(cfg)
     logger.info("All preflight checks passed.")
 
 
@@ -85,6 +98,7 @@ def wait_until_ready(
             check_preview_timestamp_font(cfg)
             check_camera(cfg)
             check_disk_space(cfg)
+            check_audio(cfg)
             logger.info("All preflight checks passed.")
             return
         except PreflightError as exc:

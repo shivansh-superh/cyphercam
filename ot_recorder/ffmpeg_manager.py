@@ -25,6 +25,7 @@ Each stream has its own segment list CSV; chunk_sequence is the 1-based line
 index in that CSV so original and preview rows with the same index align.
 """
 
+import fcntl
 import logging
 import os
 import subprocess
@@ -43,6 +44,12 @@ VARIANT_PREVIEW = "preview"
 
 # Default FFmpeg localtime format (no fmt arg — colons in fmt break filter parsing on 6.x)
 _DRAWTEXT_TIME = r"%{localtime}"
+
+# Linux fcntl constant — not exposed by name in the fcntl module.
+_F_SETPIPE_SZ = 1031
+# 4 MB gives remux a large window to absorb SD-card write stalls before capture
+# ever blocks and drops frames from the V4L2 buffer.
+_PIPE_BUF_SIZE = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -93,16 +100,33 @@ class FFmpegManager:
                 output_dir=base_dir / VARIANT_ORIGINAL,
                 segment_list_path=base_dir / VARIANT_ORIGINAL / "segments.csv",
             ),
-            _StreamOutput(
-                variant=VARIANT_PREVIEW,
-                output_dir=base_dir / VARIANT_PREVIEW,
-                segment_list_path=base_dir / VARIANT_PREVIEW / "segments.csv",
-            ),
         ]
+        if self.cfg.preview_enabled:
+            self._streams.append(
+                _StreamOutput(
+                    variant=VARIANT_PREVIEW,
+                    output_dir=base_dir / VARIANT_PREVIEW,
+                    segment_list_path=base_dir / VARIANT_PREVIEW / "segments.csv",
+                )
+            )
         for stream in self._streams:
             stream.output_dir.mkdir(parents=True, exist_ok=True)
 
-        capture_cmd = self._build_capture_cmd()
+        # Audio is best-effort: if the mic is disabled or unreachable we still
+        # record video. Probe the ALSA device first so a missing/busy mic never
+        # takes down the whole ffmpeg pipeline.
+        use_audio = False
+        if self.cfg.audio_enabled:
+            if self._audio_available():
+                use_audio = True
+                logger.info(f"Audio enabled: {self.cfg.audio_device}")
+            else:
+                logger.warning(
+                    f"Audio device {self.cfg.audio_device} unavailable — "
+                    "recording video only for this session."
+                )
+
+        capture_cmd = self._build_capture_cmd(use_audio)
         remux_cmd = self._build_remux_cmd()
         logger.info(f"Starting ffmpeg (capture): {' '.join(capture_cmd)}")
         logger.info(f"Starting ffmpeg (remux): {' '.join(remux_cmd)}")
@@ -113,6 +137,17 @@ class FFmpegManager:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+        # Enlarge the OS pipe buffer so that brief remux disk stalls (e.g. when
+        # closing an MP4 segment on an SD card) don't back-pressure capture and
+        # cause V4L2 frame drops. F_SETPIPE_SZ is Linux-specific; fail silently
+        # on other platforms (macOS dev machines, etc.).
+        if self._capture.stdout:
+            try:
+                fcntl.fcntl(self._capture.stdout.fileno(), _F_SETPIPE_SZ, _PIPE_BUF_SIZE)
+                logger.info(f"Pipe buffer set to {_PIPE_BUF_SIZE // 1024} KB")
+            except OSError as exc:
+                logger.warning(f"Could not enlarge pipe buffer: {exc}")
+
         self._remux = subprocess.Popen(
             remux_cmd,
             stdin=self._capture.stdout,
@@ -198,32 +233,81 @@ class FFmpegManager:
         self._streams = []
         return clean
 
-    def _build_capture_cmd(self) -> list[str]:
+    def _build_capture_cmd(self, use_audio: bool) -> list[str]:
         """
         Reads the camera once and produces:
-          * original: VPU-encoded H.264/HEVC as an MPEG-TS elementary stream on
-            stdout (consumed by the remux process — never written to disk)
+          * original: VPU-encoded H.264/HEVC (+ AAC audio when use_audio) as an
+            MPEG-TS elementary stream on stdout (consumed by remux — never on disk)
           * preview:  1 fps / 720p libx264 MP4 segments written directly to disk
+            (omitted when cfg.preview_enabled is False)
+
+        Audio (when enabled) is captured from a separate ALSA device and added to
+        the original only; the preview stays silent.
         """
         cfg = self.cfg
-        preview = self._streams[1]
-        preview_pattern = str(preview.output_dir / "%Y%m%d_%H%M%S.mp4")
-        preview_vf = self._build_preview_video_filter(cfg)
 
         # Keyframe interval aligned to chunk boundaries so the downstream segment
         # muxer can cut at exactly chunk_duration_seconds on an IDR.
         # -g is silently ignored by v4l2m2m encoders; -force_key_frames is the workaround.
         original_gop = cfg.video_fps * cfg.chunk_duration_seconds
-        preview_gop = cfg.preview_fps * cfg.chunk_duration_seconds
+
+        # The ALSA mic and the V4L2 camera run on independent clocks, so over a
+        # long surgery the audio would drift out of sync. aresample=async=1 keeps
+        # audio locked to the timeline by stretching/padding to match its PTS.
+        audio_inputs: list[str] = []
+        audio_output: list[str] = []
+        if use_audio:
+            audio_inputs = [
+                "-thread_queue_size", "1024",
+                "-f", "alsa",
+                "-ac", str(cfg.audio_channels),
+                "-ar", str(cfg.audio_sample_rate),
+                "-i", cfg.audio_device,
+            ]
+            audio_output = [
+                "-map", "1:a",
+                "-c:a", "aac",
+                "-b:a", f"{cfg.audio_bitrate_kbps}k",
+                "-af", "aresample=async=1",
+            ]
+
+        preview_output: list[str] = []
+        if cfg.preview_enabled:
+            preview = self._streams[1]
+            preview_pattern = str(preview.output_dir / "%Y%m%d_%H%M%S.mp4")
+            preview_vf = self._build_preview_video_filter(cfg)
+            preview_gop = cfg.preview_fps * cfg.chunk_duration_seconds
+            # Preview — drop to 1 fps before scale to minimize CPU. libx264 supplies
+            # extradata correctly, so this muxes straight to MP4 segments.
+            preview_output = [
+                "-map", "0:v",
+                "-an",
+                "-vf", preview_vf,
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", str(cfg.preview_crf),
+                "-g", str(preview_gop),
+                "-f", "segment",
+                "-segment_time", str(cfg.chunk_duration_seconds),
+                "-segment_format", "mp4",
+                "-reset_timestamps", "1",
+                "-strftime", "1",
+                "-segment_list_type", "csv",
+                "-segment_list_flags", "+cache",
+                "-segment_list", str(preview.segment_list_path),
+                preview_pattern,
+            ]
 
         return [
             "ffmpeg",
             "-hide_banner",
+            "-thread_queue_size", "1024",
             "-f", "v4l2",
             "-input_format", "mjpeg",
             "-video_size", f"{cfg.video_width}x{cfg.video_height}",
             "-framerate", str(cfg.video_fps),
             "-i", cfg.camera_device,
+            *audio_inputs,
 
             # Original — hardware encode via Pi VPU, emitted as MPEG-TS on stdout.
             # bcm2835-codec requires yuv420p; MJPEG decodes to yuvj422p so we convert explicitly.
@@ -231,35 +315,18 @@ class FFmpegManager:
             # MPEG-TS keeps SPS/PPS inline at each IDR and preserves timestamps, which the
             # remux step needs to produce self-contained, correctly-cut MP4 chunks.
             "-map", "0:v",
-            "-an",
             "-vf", "format=yuv420p",
             "-c:v", cfg.video_codec,
             "-b:v", f"{cfg.original_video_bitrate_kbps}k",
             "-maxrate", f"{cfg.original_video_bitrate_kbps}k",
-            "-bufsize", f"{cfg.original_video_bitrate_kbps}k",
+            "-bufsize", f"{cfg.original_video_bufsize_kbps}k",
             "-g", str(original_gop),
             "-force_key_frames", f"expr:gte(t,n_forced*{cfg.chunk_duration_seconds})",
+            *audio_output,
             "-f", "mpegts",
             "pipe:1",
 
-            # Preview — drop to 1 fps before scale to minimize CPU. libx264 supplies
-            # extradata correctly, so this muxes straight to MP4 segments.
-            "-map", "0:v",
-            "-an",
-            "-vf", preview_vf,
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", str(cfg.preview_crf),
-            "-g", str(preview_gop),
-            "-f", "segment",
-            "-segment_time", str(cfg.chunk_duration_seconds),
-            "-segment_format", "mp4",
-            "-reset_timestamps", "1",
-            "-strftime", "1",
-            "-segment_list_type", "csv",
-            "-segment_list_flags", "+cache",
-            "-segment_list", str(preview.segment_list_path),
-            preview_pattern,
+            *preview_output,
         ]
 
     def _build_remux_cmd(self) -> list[str]:
@@ -273,14 +340,16 @@ class FFmpegManager:
         original = self._streams[0]
         original_pattern = str(original.output_dir / "%Y%m%d_%H%M%S.mp4")
 
+        # -map 0:a? is optional: it copies the audio track when the capture stage
+        # included one and is a no-op when recording video only.
         return [
             "ffmpeg",
             "-hide_banner",
             "-f", "mpegts",
             "-i", "pipe:0",
             "-map", "0:v",
-            "-an",
-            "-c:v", "copy",
+            "-map", "0:a?",
+            "-c", "copy",
             "-f", "segment",
             "-segment_time", str(cfg.chunk_duration_seconds),
             "-segment_format", "mp4",
@@ -291,6 +360,37 @@ class FFmpegManager:
             "-segment_list", str(original.segment_list_path),
             original_pattern,
         ]
+
+    def _audio_available(self) -> bool:
+        """
+        Probe the ALSA mic with a brief capture. Returns True only if ffmpeg can
+        actually open and read the device, so a missing/busy/misconfigured mic
+        degrades to video-only instead of taking down the whole pipeline.
+        """
+        cfg = self.cfg
+        probe_cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostdin",
+            "-f", "alsa",
+            "-ac", str(cfg.audio_channels),
+            "-ar", str(cfg.audio_sample_rate),
+            "-i", cfg.audio_device,
+            "-t", "0.3",
+            "-f", "null",
+            "-",
+        ]
+        try:
+            result = subprocess.run(
+                probe_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+            return result.returncode == 0
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning(f"Audio probe errored for {cfg.audio_device}: {exc}")
+            return False
 
     def _build_preview_video_filter(self, cfg: Config) -> str:
         """1 fps preview at 720p with wall-clock timestamp (preview only)."""
