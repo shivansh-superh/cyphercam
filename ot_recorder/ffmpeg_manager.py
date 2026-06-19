@@ -140,16 +140,31 @@ class FFmpegManager:
         cfg = self.cfg
         original = self._streams[0]
         preview = self._streams[1]
-        original_pattern = str(original.output_dir / "%Y%m%d_%H%M%S.mp4")
+        # Original uses MPEG-TS: h264_v4l2m2m outputs Annex B (SPS/PPS inline in the
+        # bitstream) rather than AVCC (SPS/PPS in the MP4 container avcC box). The MP4
+        # muxer needs AVCC and produces empty global headers when the encoder doesn't
+        # supply extradata, so segments 2+ have no parameter sets and play as black.
+        # MPEG-TS is Annex B native and sidesteps that mismatch entirely.
+        original_pattern = str(original.output_dir / "%Y%m%d_%H%M%S.ts")
         preview_pattern = str(preview.output_dir / "%Y%m%d_%H%M%S.mp4")
         preview_vf = self._build_preview_video_filter(cfg)
 
         # Keyframe interval aligned to chunk boundaries so the segment muxer
         # can cut at exactly chunk_duration_seconds without waiting for the next IDR.
+        # -g is silently ignored by v4l2m2m encoders; -force_key_frames is the workaround.
         original_gop = cfg.video_fps * cfg.chunk_duration_seconds
         preview_gop = cfg.preview_fps * cfg.chunk_duration_seconds
 
-        segment_opts = [
+        original_segment_opts = [
+            "-f", "segment",
+            "-segment_time", str(cfg.chunk_duration_seconds),
+            "-segment_format", "mpegts",
+            "-reset_timestamps", "1",
+            "-strftime", "1",
+            "-segment_list_type", "csv",
+            "-segment_list_flags", "+cache",
+        ]
+        preview_segment_opts = [
             "-f", "segment",
             "-segment_time", str(cfg.chunk_duration_seconds),
             "-segment_format", "mp4",
@@ -167,12 +182,9 @@ class FFmpegManager:
             "-framerate", str(cfg.video_fps),
             "-i", cfg.camera_device,
 
-            # Original — hardware encode via Pi VPU, offloads encoding from CPU.
+            # Original — hardware encode via Pi VPU into MPEG-TS segments.
             # bcm2835-codec requires yuv420p; MJPEG decodes to yuvj422p so we convert explicitly.
-            # -g is silently ignored by v4l2m2m encoders, so we use -force_key_frames to guarantee
-            # an IDR at every segment boundary. repeatsequenceheader instructs the bcm2835-codec
-            # driver (via V4L2_CID_MPEG_VIDEO_REPEAT_SEQ_HEADER) to embed SPS/PPS before every IDR
-            # frame, making each segment file self-contained and independently decodable.
+            # -force_key_frames guarantees an IDR at every segment boundary since -g is ignored.
             "-map", "0:v",
             "-an",
             "-vf", "format=yuv420p",
@@ -182,9 +194,7 @@ class FFmpegManager:
             "-bufsize", f"{cfg.original_video_bitrate_kbps}k",
             "-g", str(original_gop),
             "-force_key_frames", f"expr:gte(t,n_forced*{cfg.chunk_duration_seconds})",
-            "-extra_ctrls", "repeatsequenceheader=1",
-            "-bsf:v", "dump_extra",
-            *segment_opts,
+            *original_segment_opts,
             "-segment_list", str(original.segment_list_path),
             original_pattern,
 
@@ -196,7 +206,7 @@ class FFmpegManager:
             "-preset", "ultrafast",
             "-crf", str(cfg.preview_crf),
             "-g", str(preview_gop),
-            *segment_opts,
+            *preview_segment_opts,
             "-segment_list", str(preview.segment_list_path),
             preview_pattern,
         ]
