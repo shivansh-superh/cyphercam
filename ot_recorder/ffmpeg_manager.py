@@ -273,10 +273,17 @@ class FFmpegManager:
                 )
 
     def _log_ffmpeg_stderr(self):
-        """Stream ffmpeg stderr to our logger at DEBUG level."""
+        """Stream ffmpeg stderr to our logger."""
         if not self._process or not self._process.stderr:
             return
         for line in self._process.stderr:
             decoded = line.decode("utf-8", errors="replace").rstrip()
-            if decoded:
+            if not decoded:
+                continue
+            # Surface errors and warnings at the appropriate level so they
+            # appear in journalctl without needing DEBUG logging globally.
+            lower = decoded.lower()
+            if any(w in lower for w in ("error", "invalid", "failed", "corrupt", "warning")):
+                logger.warning(f"[ffmpeg] {decoded}")
+            else:
                 logger.debug(f"[ffmpeg] {decoded}")
