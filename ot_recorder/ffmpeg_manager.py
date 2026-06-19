@@ -1,31 +1,28 @@
 """
-Manages the ffmpeg subprocess(es).
+Manages the ffmpeg subprocess.
 
-Two ffmpeg processes are chained by a pipe:
+A single ffmpeg process reads the camera and writes two outputs directly to disk:
 
-  capture  — reads the camera once and produces two outputs:
-    * original: MJPEG decode → H.264/HEVC via the Pi VPU (h264_v4l2m2m),
-      written to stdout as an MPEG-TS elementary stream (pipe, never on disk)
-    * preview:  decode → 1 fps → 720p → libx264, written directly as MP4 segments
-
-  remux    — reads the original MPEG-TS from the pipe and stream-copies it into
+  * original: MJPEG decode → H.264/HEVC via the Pi VPU (h264_v4l2m2m) →
     MP4 segments ({chunk_dir}/{surgery_id}/original/YYYYMMDD_HHMMSS.mp4)
 
-Why the extra remux hop: the v4l2m2m encoder cannot hand the MP4 muxer its
-SPS/PPS extradata at init time (it only emits parameter sets after the first
-frame is encoded). Muxing the VPU output straight to segmented MP4 therefore
-leaves every segment's avcC box empty, so only the first chunk — which happens
-to carry SPS/PPS inline — decodes, and all later chunks play back black. Going
-through MPEG-TS preserves timestamps and keeps SPS/PPS inline at every keyframe;
-the remux step's TS demuxer recovers them into real extradata, giving each MP4
-segment a valid avcC. See raspberrypi/linux#5150. Preview uses libx264, which
-populates extradata correctly, so it muxes to MP4 directly.
+  * preview:  decode → 1 fps → 720p → libx264 → MP4 segments
+    (omitted when PREVIEW_ENABLED=false)
+
+The v4l2m2m encoder does not supply SPS/PPS extradata at init time (it only
+emits parameter sets inline in the bitstream after the first encoded frame).
+The -bsf:v extract_extradata bitstream filter reads those inline parameter sets
+from the first IDR frame and promotes them to codec extradata before the MP4
+muxer writes the avcC box, so every segment — including segments 2, 3, … — is
+independently decodable. This replaces the earlier two-process design where a
+second ffmpeg instance remuxed MPEG-TS from a pipe into MP4; that pipe was the
+source of periodic frame drops when SD-card write stalls filled the kernel pipe
+buffer and back-pressured the V4L2 capture loop. See raspberrypi/linux#5150.
 
 Each stream has its own segment list CSV; chunk_sequence is the 1-based line
 index in that CSV so original and preview rows with the same index align.
 """
 
-import fcntl
 import logging
 import os
 import subprocess
@@ -44,24 +41,6 @@ VARIANT_PREVIEW = "preview"
 
 # Default FFmpeg localtime format (no fmt arg — colons in fmt break filter parsing on 6.x)
 _DRAWTEXT_TIME = r"%{localtime}"
-
-# Linux fcntl constant — not exposed by name in the fcntl module.
-_F_SETPIPE_SZ = 1031
-# Target pipe buffer size. Without CAP_SYS_RESOURCE a process cannot exceed
-# /proc/sys/fs/pipe-max-size (typically 1 MB on Pi OS). We clamp to that limit
-# so the enlargement always succeeds regardless of the service's capabilities.
-_PIPE_BUF_TARGET = 4 * 1024 * 1024
-
-
-def _pipe_buf_size() -> int:
-    """Return the pipe buffer size to request, capped at the system maximum."""
-    try:
-        max_size = int(
-            Path("/proc/sys/fs/pipe-max-size").read_text().strip()
-        )
-        return min(_PIPE_BUF_TARGET, max_size)
-    except OSError:
-        return _PIPE_BUF_TARGET
 
 
 @dataclass(frozen=True)
@@ -83,10 +62,7 @@ class FFmpegManager:
         """
         self.cfg = cfg
         self.on_chunk_complete = on_chunk_complete
-        # _capture reads the camera and emits original (MPEG-TS via pipe) + preview (MP4).
-        # _remux reads the piped MPEG-TS and writes the original MP4 segments.
         self._capture: Optional[subprocess.Popen] = None
-        self._remux: Optional[subprocess.Popen] = None
         self._monitor_thread: Optional[threading.Thread] = None
         self._surgery_id: Optional[str] = None
         self._streams: list[_StreamOutput] = []
@@ -139,39 +115,13 @@ class FFmpegManager:
                 )
 
         capture_cmd = self._build_capture_cmd(use_audio)
-        remux_cmd = self._build_remux_cmd()
-        logger.info(f"Starting ffmpeg (capture): {' '.join(capture_cmd)}")
-        logger.info(f"Starting ffmpeg (remux): {' '.join(remux_cmd)}")
+        logger.info(f"Starting ffmpeg: {' '.join(capture_cmd)}")
 
-        # Capture writes the original MPEG-TS to stdout; remux consumes it from stdin.
         self._capture = subprocess.Popen(
             capture_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        # Enlarge the OS pipe buffer so that brief remux disk stalls (e.g. when
-        # closing an MP4 segment on an SD card) don't back-pressure capture and
-        # cause V4L2 frame drops. F_SETPIPE_SZ is Linux-specific; fail silently
-        # on other platforms (macOS dev machines, etc.).
-        if self._capture.stdout:
-            try:
-                buf_size = _pipe_buf_size()
-                fcntl.fcntl(self._capture.stdout.fileno(), _F_SETPIPE_SZ, buf_size)
-                logger.info(f"Pipe buffer set to {buf_size // 1024} KB")
-            except OSError as exc:
-                logger.warning(f"Could not enlarge pipe buffer: {exc}")
-
-        self._remux = subprocess.Popen(
-            remux_cmd,
-            stdin=self._capture.stdout,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
-        # Close our copy of the pipe's read end so only remux holds it; this lets
-        # capture receive SIGPIPE if remux dies, and lets remux see EOF when
-        # capture exits.
-        if self._capture.stdout:
-            self._capture.stdout.close()
 
         self._monitor_thread = threading.Thread(
             target=self._monitor_segments,
@@ -180,88 +130,66 @@ class FFmpegManager:
         )
         self._monitor_thread.start()
 
-        for proc, tag in ((self._capture, "ffmpeg"), (self._remux, "remux")):
-            threading.Thread(
-                target=self._log_ffmpeg_stderr,
-                args=(proc, tag),
-                name=f"{tag}-stderr",
-                daemon=True,
-            ).start()
+        threading.Thread(
+            target=self._log_ffmpeg_stderr,
+            args=(self._capture, "ffmpeg"),
+            name="ffmpeg-stderr",
+            daemon=True,
+        ).start()
 
-        logger.info(
-            f"ffmpeg started (capture pid {self._capture.pid}, "
-            f"remux pid {self._remux.pid}) for surgery {surgery_id}"
-        )
+        logger.info(f"ffmpeg started (pid {self._capture.pid}) for surgery {surgery_id}")
 
     def stop(self, timeout: int = 30) -> bool:
         """
-        Gracefully stop recording. SIGTERMs the capture process so it finalizes
-        the current preview segment and closes the pipe; remux then drains the
-        remaining MPEG-TS, finalizes its last original segment on EOF, and exits.
-        Returns True if both stopped cleanly, False if we had to SIGKILL either.
+        Gracefully stop recording. SIGTERMs ffmpeg so it finalizes the current
+        segment before exiting. Returns True if it stopped cleanly, False if we
+        had to SIGKILL it.
         """
-        if not self._capture and not self._remux:
+        if not self._capture:
             return True
 
         self._stop_event.set()
         clean = True
 
-        # Stop capture first so remux gets a clean EOF and flushes its last chunk.
-        if self._capture:
-            logger.info("Sending SIGTERM to ffmpeg (capture)...")
-            self._capture.terminate()
-            try:
-                self._capture.wait(timeout=timeout)
-                logger.info("ffmpeg (capture) stopped cleanly")
-            except subprocess.TimeoutExpired:
-                logger.warning(
-                    f"ffmpeg (capture) did not stop within {timeout}s, sending SIGKILL"
-                )
-                self._capture.kill()
-                self._capture.wait()
-                clean = False
-
-        # Remux should exit on its own once the pipe closes; give it a window.
-        if self._remux:
-            try:
-                self._remux.wait(timeout=timeout)
-                logger.info("ffmpeg (remux) stopped cleanly")
-            except subprocess.TimeoutExpired:
-                logger.warning(
-                    f"ffmpeg (remux) did not drain within {timeout}s, sending SIGTERM"
-                )
-                self._remux.terminate()
-                try:
-                    self._remux.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    logger.warning("ffmpeg (remux) ignored SIGTERM, sending SIGKILL")
-                    self._remux.kill()
-                    self._remux.wait()
-                    clean = False
+        logger.info("Sending SIGTERM to ffmpeg...")
+        self._capture.terminate()
+        try:
+            self._capture.wait(timeout=timeout)
+            logger.info("ffmpeg stopped cleanly")
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                f"ffmpeg did not stop within {timeout}s, sending SIGKILL"
+            )
+            self._capture.kill()
+            self._capture.wait()
+            clean = False
 
         self._scan_all_segment_lists()
         self._capture = None
-        self._remux = None
         self._surgery_id = None
         self._streams = []
         return clean
 
     def _build_capture_cmd(self, use_audio: bool) -> list[str]:
         """
-        Reads the camera once and produces:
-          * original: VPU-encoded H.264/HEVC (+ AAC audio when use_audio) as an
-            MPEG-TS elementary stream on stdout (consumed by remux — never on disk)
-          * preview:  1 fps / 720p libx264 MP4 segments written directly to disk
+        Reads the camera and writes two outputs directly to disk:
+          * original: VPU-encoded H.264/HEVC (+ AAC audio when use_audio) as
+            segmented MP4. The extract_extradata BSF promotes inline SPS/PPS
+            from the first IDR into codec extradata so every segment's avcC box
+            is correctly populated (workaround for raspberrypi/linux#5150).
+          * preview:  1 fps / 720p libx264 MP4 segments
             (omitted when cfg.preview_enabled is False)
 
-        Audio (when enabled) is captured from a separate ALSA device and added to
-        the original only; the preview stays silent.
+        Audio (when enabled) is captured from a separate ALSA device and added
+        to the original only; the preview stays silent.
         """
         cfg = self.cfg
+        original = self._streams[0]
+        original_pattern = str(original.output_dir / "%Y%m%d_%H%M%S.mp4")
 
-        # Keyframe interval aligned to chunk boundaries so the downstream segment
-        # muxer can cut at exactly chunk_duration_seconds on an IDR.
-        # -g is silently ignored by v4l2m2m encoders; -force_key_frames is the workaround.
+        # Keyframe interval aligned to chunk boundaries so the segment muxer
+        # can cut on an IDR. -g is silently ignored by v4l2m2m encoders;
+        # -force_key_frames is the workaround.
         original_gop = cfg.video_fps * cfg.chunk_duration_seconds
 
         # The ALSA mic and the V4L2 camera run on independent clocks, so over a
@@ -290,8 +218,8 @@ class FFmpegManager:
             preview_pattern = str(preview.output_dir / "%Y%m%d_%H%M%S.mp4")
             preview_vf = self._build_preview_video_filter(cfg)
             preview_gop = cfg.preview_fps * cfg.chunk_duration_seconds
-            # Preview — drop to 1 fps before scale to minimize CPU. libx264 supplies
-            # extradata correctly, so this muxes straight to MP4 segments.
+            # Preview — drop to 1 fps before scale to minimize CPU. libx264
+            # supplies extradata correctly so no BSF is needed here.
             preview_output = [
                 "-map", "0:v",
                 "-an",
@@ -322,11 +250,11 @@ class FFmpegManager:
             "-i", cfg.camera_device,
             *audio_inputs,
 
-            # Original — hardware encode via Pi VPU, emitted as MPEG-TS on stdout.
+            # Original — hardware encode via Pi VPU, written directly to MP4 segments.
             # bcm2835-codec requires yuv420p; MJPEG decodes to yuvj422p so we convert explicitly.
             # -force_key_frames guarantees an IDR at every chunk boundary since -g is ignored.
-            # MPEG-TS keeps SPS/PPS inline at each IDR and preserves timestamps, which the
-            # remux step needs to produce self-contained, correctly-cut MP4 chunks.
+            # extract_extradata BSF reads inline SPS/PPS from the first IDR and promotes them
+            # to codec extradata so the MP4 muxer can populate the avcC box for every segment.
             "-map", "0:v",
             "-vf", "format=yuv420p",
             "-c:v", cfg.video_codec,
@@ -336,33 +264,7 @@ class FFmpegManager:
             "-g", str(original_gop),
             "-force_key_frames", f"expr:gte(t,n_forced*{cfg.chunk_duration_seconds})",
             *audio_output,
-            "-f", "mpegts",
-            "pipe:1",
-
-            *preview_output,
-        ]
-
-    def _build_remux_cmd(self) -> list[str]:
-        """
-        Reads the original MPEG-TS from stdin and stream-copies it into MP4
-        segments. Demuxing TS recovers SPS/PPS into real extradata, so every MP4
-        chunk gets a valid avcC box (unlike muxing the VPU output to MP4 directly,
-        which leaves segments 2+ black). No re-encode happens here.
-        """
-        cfg = self.cfg
-        original = self._streams[0]
-        original_pattern = str(original.output_dir / "%Y%m%d_%H%M%S.mp4")
-
-        # -map 0:a? is optional: it copies the audio track when the capture stage
-        # included one and is a no-op when recording video only.
-        return [
-            "ffmpeg",
-            "-hide_banner",
-            "-f", "mpegts",
-            "-i", "pipe:0",
-            "-map", "0:v",
-            "-map", "0:a?",
-            "-c", "copy",
+            "-bsf:v", "extract_extradata",
             "-f", "segment",
             "-segment_time", str(cfg.chunk_duration_seconds),
             "-segment_format", "mp4",
@@ -372,6 +274,8 @@ class FFmpegManager:
             "-segment_list_flags", "+cache",
             "-segment_list", str(original.segment_list_path),
             original_pattern,
+
+            *preview_output,
         ]
 
     def _audio_available(self) -> bool:
@@ -425,14 +329,12 @@ class FFmpegManager:
         while not self._stop_event.is_set():
             self._scan_all_segment_lists()
 
-            for proc, tag in ((self._capture, "capture"), (self._remux, "remux")):
-                if proc and proc.poll() is not None:
-                    if not self._stop_event.is_set():
-                        logger.error(
-                            f"ffmpeg ({tag}) exited unexpectedly with code "
-                            f"{proc.returncode}"
-                        )
-                    return
+            if self._capture and self._capture.poll() is not None:
+                if not self._stop_event.is_set():
+                    logger.error(
+                        f"ffmpeg exited unexpectedly with code {self._capture.returncode}"
+                    )
+                return
 
             time.sleep(2)
 
