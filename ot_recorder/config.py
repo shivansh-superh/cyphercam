@@ -13,9 +13,14 @@ REQUIRED_VARS = [
     "TB_ACCESS_TOKEN",
 ]
 
+VALID_DEVICE_MODES = ("ot", "er")
+
 
 @dataclass
 class Config:
+    device_mode: str  # "ot" (trigger-based + AI analysis) | "er" (continuous 24/7)
+    ai_analysis_enabled: bool
+
     ot_location_id: str
     ot_location_name: str
     ot_hospital_id: str
@@ -35,6 +40,7 @@ class Config:
     video_height: int
     video_fps: int
     video_codec: str
+    video_encoder_preset: str  # libx264 preset (ignored for hw encoders)
     original_video_bitrate_kbps: int
     original_video_bufsize_kbps: int
 
@@ -70,6 +76,19 @@ def load_config() -> Config:
     if missing:
         raise EnvironmentError(f"Missing required environment variables: {', '.join(missing)}")
 
+    device_mode = os.environ.get("DEVICE_MODE", "ot").lower()
+    if device_mode not in VALID_DEVICE_MODES:
+        raise EnvironmentError(
+            f"DEVICE_MODE must be one of {VALID_DEVICE_MODES}, got: {device_mode!r}"
+        )
+
+    ai_analysis_default = "true" if device_mode == "ot" else "false"
+    ai_analysis_enabled = os.environ.get("AI_ANALYSIS_ENABLED", ai_analysis_default).lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
     tb_mqtt_use_tls = os.environ.get("TB_MQTT_USE_TLS", "false").lower() in (
         "1",
         "true",
@@ -80,6 +99,8 @@ def load_config() -> Config:
     )
 
     return Config(
+        device_mode=device_mode,
+        ai_analysis_enabled=ai_analysis_enabled,
         ot_location_id=os.environ["OT_LOCATION_ID"],
         ot_location_name=os.environ["OT_LOCATION_NAME"],
         ot_hospital_id=os.environ["OT_HOSPITAL_ID"],
@@ -98,7 +119,8 @@ def load_config() -> Config:
         video_width=int(os.environ.get("VIDEO_WIDTH", "1280")),
         video_height=int(os.environ.get("VIDEO_HEIGHT", "720")),
         video_fps=int(os.environ.get("VIDEO_FPS", "15")),
-        video_codec=os.environ.get("VIDEO_CODEC", "hevc_v4l2m2m"),
+        video_codec=os.environ.get("VIDEO_CODEC", "libx264"),
+        video_encoder_preset=os.environ.get("VIDEO_ENCODER_PRESET", "medium"),
         original_video_bitrate_kbps=int(os.environ.get("VIDEO_BITRATE_KBPS", "1800")),
         original_video_bufsize_kbps=int(
             os.environ.get(

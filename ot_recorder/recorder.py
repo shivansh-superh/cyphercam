@@ -20,6 +20,7 @@ import os
 import signal
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from .config import load_config
@@ -49,7 +50,11 @@ class Recorder:
         )
         self.uploader = Uploader(self.cfg, self.manifest, self.thingsboard)
         self.thingsboard.on_connected = self.uploader.retry_pending_analyze
-        self.ffmpeg = FFmpegManager(self.cfg, on_chunk_complete=self._on_chunk_complete)
+        self.ffmpeg = FFmpegManager(
+            self.cfg,
+            on_chunk_complete=self._on_chunk_complete,
+            on_unexpected_stop=self._on_ffmpeg_died,
+        )
 
         self._current_surgery_id: Optional[str] = None
         self._state: str = "idle"  # idle | starting | recording | stopping
@@ -161,6 +166,10 @@ class Recorder:
         finally:
             self.thingsboard.publish_status()
 
+        if self.cfg.device_mode == "er" and not self._shutdown_event.is_set():
+            logger.info("ER mode: restarting recording after session %s", surgery_id)
+            self._start_er_recording()
+
     def _cancel_auto_stop_timer(self):
         if self._auto_stop_timer:
             self._auto_stop_timer.cancel()
@@ -170,6 +179,27 @@ class Recorder:
         logger.warning(
             f"Auto-stop triggered for surgery {surgery_id} (scheduled duration exceeded)"
         )
+        self.trigger_stop(surgery_id)
+
+    # -------------------------------------------------------------------------
+    # ER mode
+    # -------------------------------------------------------------------------
+
+    def _start_er_recording(self):
+        session_id = f"er-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+        logger.info(f"ER mode: auto-starting recording as session {session_id}")
+        self.trigger_start(session_id, scheduled_duration_minutes=None)
+
+    def _on_ffmpeg_died(self):
+        """Called by FFmpegManager when ffmpeg exits without an explicit stop()."""
+        with self._state_lock:
+            surgery_id = self._current_surgery_id
+            state = self._state
+
+        if state not in ("recording", "starting"):
+            return
+
+        logger.error("ffmpeg exited unexpectedly during session %s", surgery_id)
         self.trigger_stop(surgery_id)
 
     # -------------------------------------------------------------------------
@@ -292,7 +322,7 @@ class Recorder:
 
     def run(self):
         logger.info(
-            f"OT Recorder starting — "
+            f"Recorder starting [{self.cfg.device_mode.upper()} mode] — "
             f"{self.cfg.ot_location_name} ({self.cfg.ot_location_id}) "
             f"at {self.cfg.ot_hospital_id}"
         )
@@ -308,7 +338,11 @@ class Recorder:
         self.uploader.start()
         self.thingsboard.start()
 
-        logger.info("Recorder ready. Waiting for ThingsBoard RPC...")
+        if self.cfg.device_mode == "er":
+            logger.info("ER mode: auto-starting continuous recording")
+            self._start_er_recording()
+        else:
+            logger.info("OT mode: waiting for ThingsBoard RPC to start recording")
 
         # Block main thread until SIGTERM
         self._shutdown_event.wait()

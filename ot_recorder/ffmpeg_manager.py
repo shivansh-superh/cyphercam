@@ -3,21 +3,17 @@ Manages the ffmpeg subprocess.
 
 A single ffmpeg process reads the camera and writes two outputs directly to disk:
 
-  * original: MJPEG decode → H.264/HEVC via the Pi VPU (h264_v4l2m2m) →
-    MP4 segments ({chunk_dir}/{surgery_id}/original/YYYYMMDD_HHMMSS.mp4)
+  * original: MJPEG decode → libx264 (software) → MP4 segments
+    ({chunk_dir}/{surgery_id}/original/YYYYMMDD_HHMMSS.mp4)
 
   * preview:  decode → 1 fps → 720p → libx264 → MP4 segments
     (omitted when PREVIEW_ENABLED=false)
 
-The v4l2m2m encoder does not supply SPS/PPS extradata at init time (it only
-emits parameter sets inline in the bitstream after the first encoded frame).
-The -bsf:v extract_extradata bitstream filter reads those inline parameter sets
-from the first IDR frame and promotes them to codec extradata before the MP4
-muxer writes the avcC box, so every segment — including segments 2, 3, … — is
-independently decodable. This replaces the earlier two-process design where a
-second ffmpeg instance remuxed MPEG-TS from a pipe into MP4; that pipe was the
-source of periodic frame drops when SD-card write stalls filled the kernel pipe
-buffer and back-pressured the V4L2 capture loop. See raspberrypi/linux#5150.
+libx264 is used by default (VIDEO_CODEC=libx264). Hardware v4l2m2m encoders
+(h264_v4l2m2m, hevc_v4l2m2m) are still supported via VIDEO_CODEC but require
+two workarounds: the -bsf:v extract_extradata bitstream filter (VPU does not
+emit SPS/PPS extradata at init, only inline in the first IDR) and
+-force_key_frames (VPU silently ignores -g). Neither is needed for libx264.
 
 Each stream has its own segment list CSV; chunk_sequence is the 1-based line
 index in that CSV so original and preview rows with the same index align.
@@ -55,13 +51,18 @@ class FFmpegManager:
         self,
         cfg: Config,
         on_chunk_complete: Callable[[str, str, str, int], None],
+        on_unexpected_stop: Optional[Callable[[], None]] = None,
     ):
         """
         on_chunk_complete(local_path, recorded_at, variant, chunk_sequence)
         is called when ffmpeg finishes a segment and the file is safe to upload.
+
+        on_unexpected_stop is called when ffmpeg exits without stop() being called
+        (e.g. crash). Used by ER mode to auto-restart the session.
         """
         self.cfg = cfg
         self.on_chunk_complete = on_chunk_complete
+        self.on_unexpected_stop = on_unexpected_stop
         self._capture: Optional[subprocess.Popen] = None
         self._monitor_thread: Optional[threading.Thread] = None
         self._surgery_id: Optional[str] = None
@@ -173,12 +174,8 @@ class FFmpegManager:
     def _build_capture_cmd(self, use_audio: bool) -> list[str]:
         """
         Reads the camera and writes two outputs directly to disk:
-          * original: VPU-encoded H.264/HEVC (+ AAC audio when use_audio) as
-            segmented MP4. The extract_extradata BSF promotes inline SPS/PPS
-            from the first IDR into codec extradata so every segment's avcC box
-            is correctly populated (workaround for raspberrypi/linux#5150).
-          * preview:  1 fps / 720p libx264 MP4 segments
-            (omitted when cfg.preview_enabled is False)
+          * original: libx264 (or hw codec via VIDEO_CODEC) + AAC → segmented MP4
+          * preview:  1 fps / 720p libx264 MP4 segments (omitted when PREVIEW_ENABLED=false)
 
         Audio (when enabled) is captured from a separate ALSA device and added
         to the original only; the preview stays silent.
@@ -186,11 +183,9 @@ class FFmpegManager:
         cfg = self.cfg
         original = self._streams[0]
         original_pattern = str(original.output_dir / "%Y%m%d_%H%M%S.mp4")
-
-        # Keyframe interval aligned to chunk boundaries so the segment muxer
-        # can cut on an IDR. -g is silently ignored by v4l2m2m encoders;
-        # -force_key_frames is the workaround.
         original_gop = cfg.video_fps * cfg.chunk_duration_seconds
+
+        is_hw_encoder = "v4l2m2m" in cfg.video_codec
 
         # The ALSA mic and the V4L2 camera run on independent clocks, so over a
         # long surgery the audio would drift out of sync. aresample=async=1 keeps
@@ -218,8 +213,6 @@ class FFmpegManager:
             preview_pattern = str(preview.output_dir / "%Y%m%d_%H%M%S.mp4")
             preview_vf = self._build_preview_video_filter(cfg)
             preview_gop = cfg.preview_fps * cfg.chunk_duration_seconds
-            # Preview — drop to 1 fps before scale to minimize CPU. libx264
-            # supplies extradata correctly so no BSF is needed here.
             preview_output = [
                 "-map", "0:v",
                 "-an",
@@ -239,6 +232,33 @@ class FFmpegManager:
                 preview_pattern,
             ]
 
+        # v4l2m2m encoders require yuv420p and silently ignore -g, so we use
+        # -force_key_frames instead and extract_extradata to fix missing avcC data.
+        # libx264 handles all of this natively.
+        if is_hw_encoder:
+            original_encode = [
+                "-vf", "format=yuv420p",
+                "-c:v", cfg.video_codec,
+                "-b:v", f"{cfg.original_video_bitrate_kbps}k",
+                "-maxrate", f"{cfg.original_video_bitrate_kbps}k",
+                "-bufsize", f"{cfg.original_video_bufsize_kbps}k",
+                "-g", str(original_gop),
+                "-force_key_frames", f"expr:gte(t,n_forced*{cfg.chunk_duration_seconds})",
+                *audio_output,
+                "-bsf:v", "extract_extradata",
+            ]
+        else:
+            original_encode = [
+                "-vf", "format=yuv420p",
+                "-c:v", cfg.video_codec,
+                "-preset", cfg.video_encoder_preset,
+                "-b:v", f"{cfg.original_video_bitrate_kbps}k",
+                "-maxrate", f"{cfg.original_video_bitrate_kbps}k",
+                "-bufsize", f"{cfg.original_video_bufsize_kbps}k",
+                "-g", str(original_gop),
+                *audio_output,
+            ]
+
         return [
             "ffmpeg",
             "-hide_banner",
@@ -249,22 +269,8 @@ class FFmpegManager:
             "-framerate", str(cfg.video_fps),
             "-i", cfg.camera_device,
             *audio_inputs,
-
-            # Original — hardware encode via Pi VPU, written directly to MP4 segments.
-            # bcm2835-codec requires yuv420p; MJPEG decodes to yuvj422p so we convert explicitly.
-            # -force_key_frames guarantees an IDR at every chunk boundary since -g is ignored.
-            # extract_extradata BSF reads inline SPS/PPS from the first IDR and promotes them
-            # to codec extradata so the MP4 muxer can populate the avcC box for every segment.
             "-map", "0:v",
-            "-vf", "format=yuv420p",
-            "-c:v", cfg.video_codec,
-            "-b:v", f"{cfg.original_video_bitrate_kbps}k",
-            "-maxrate", f"{cfg.original_video_bitrate_kbps}k",
-            "-bufsize", f"{cfg.original_video_bufsize_kbps}k",
-            "-g", str(original_gop),
-            "-force_key_frames", f"expr:gte(t,n_forced*{cfg.chunk_duration_seconds})",
-            *audio_output,
-            "-bsf:v", "extract_extradata",
+            *original_encode,
             "-f", "segment",
             "-segment_time", str(cfg.chunk_duration_seconds),
             "-segment_format", "mp4",
@@ -274,7 +280,6 @@ class FFmpegManager:
             "-segment_list_flags", "+cache",
             "-segment_list", str(original.segment_list_path),
             original_pattern,
-
             *preview_output,
         ]
 
@@ -334,6 +339,11 @@ class FFmpegManager:
                     logger.error(
                         f"ffmpeg exited unexpectedly with code {self._capture.returncode}"
                     )
+                    if self.on_unexpected_stop:
+                        try:
+                            self.on_unexpected_stop()
+                        except Exception:
+                            logger.exception("on_unexpected_stop callback failed")
                 return
 
             time.sleep(2)

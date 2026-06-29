@@ -75,7 +75,8 @@ def check_audio(cfg: Config):
 def run_all(cfg: Config):
     logger.info("Running preflight checks...")
     check_ffmpeg()
-    check_preview_timestamp_font(cfg)
+    if cfg.preview_enabled:
+        check_preview_timestamp_font(cfg)
     check_camera(cfg)
     check_disk_space(cfg)
     check_audio(cfg)
@@ -95,7 +96,8 @@ def wait_until_ready(
     check_ffmpeg()
     while not shutdown_event.is_set():
         try:
-            check_preview_timestamp_font(cfg)
+            if cfg.preview_enabled:
+                check_preview_timestamp_font(cfg)
             check_camera(cfg)
             check_disk_space(cfg)
             check_audio(cfg)
